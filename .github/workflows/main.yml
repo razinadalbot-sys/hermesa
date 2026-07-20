@@ -20,8 +20,6 @@ jobs:
 
     steps:
       # ── 0. Acquire global lock: only ONE Hermes run anywhere, ever ──
-      # Atomic: creating the 'lock' branch fails if it exists (no race possible).
-      # Waits up to ~90 min, stealing the lock if its heartbeat is >20 min stale.
       - name: Acquire global run lock
         env:
           DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
@@ -39,9 +37,8 @@ jobs:
                 continue
               fi
               echo "💀 Stale lock (${AGE}s) — previous run died. Stealing lock."
-              git push -q "$REPO_URL" --delete lock 2>/dev/null || true
+              git push -q "$REPO_URL" --delete lock || echo "⚠️ lock delete failed"
             fi
-            # Try to acquire (atomic: fails if branch appeared meanwhile)
             rm -rf /tmp/lock && mkdir /tmp/lock && cd /tmp/lock
             git init -q -b lock
             git config user.name hermes-lock
@@ -74,9 +71,10 @@ jobs:
           done
           echo "Restored $(du -sh "$HERMES_HOME" 2>/dev/null | cut -f1) of Hermes data"
 
-      # ── 2. Install Hermes Agent ──
+      # ── 2. Install Hermes Agent (FIX: clean stale install dir first) ──
       - name: Install Hermes Agent
         run: |
+          rm -rf "$HERMES_HOME/hermes-agent"
           curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
@@ -162,7 +160,7 @@ jobs:
           #!/bin/bash
           cd "$HERMES_HOME" || exit 0
           TMP=$(mktemp -d)
-          rsync -a --exclude '.env' --exclude '.git' --exclude '*.log' ./ "$TMP/"
+          rsync -a --exclude '.env' --exclude '.git' --exclude '*.log' --exclude 'hermes-agent' ./ "$TMP/"
           cd "$TMP"
           find . -type f -size +90M ! -name "*.gh-chunk.*" | while read -r f; do
             split -b 90M -d -a 3 "$f" "$f.gh-chunk."; rm "$f"
@@ -186,11 +184,11 @@ jobs:
           TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
         run: |
           curl -s -X POST \
-            "{{https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}}}/sendMessage" \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_USER_ID}" \
             -d text="🟢 Hermes online (run ${{ github.run_id }})" > /dev/null || true
 
-      # ── 9. Gateway with crash auto-restart (budget counted from JOB start) ──
+      # ── 9. Gateway with crash auto-restart (budget from JOB start) ──
       - name: Run Hermes gateway (Telegram bot)
         run: |
           JOB_START=$(cat /tmp/job_start)
@@ -203,16 +201,18 @@ jobs:
             sleep 10
           done
 
-      # ── 10. Push data back (+ chunk >90MB files) ──
+      # ── 10. Push data back (FIX: exclude hermes-agent install dir) ──
       - name: Push Hermes data to private data repo
         if: always()
         run: |
           cd "$HERMES_HOME"
           rm -f .env
           rm -rf .git
+          rm -rf hermes-agent
           cat > .gitignore <<'EOF'
           .env
           *.log
+          hermes-agent/
           EOF
           find . -type f -size +90M ! -name "*.gh-chunk.*" | while read -r f; do
             split -b 90M -d -a 3 "$f" "$f.gh-chunk."
@@ -235,8 +235,7 @@ jobs:
           DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
         run: |
           git push -q "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git" \
-            --delete lock 2>/dev/null || true
-          echo "Lock released"
+            --delete lock || echo "⚠️ lock delete failed"
 
       # ── 12. Notify failure ──
       - name: Notify failure (Telegram)
@@ -246,6 +245,6 @@ jobs:
           TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
         run: |
           curl -s -X POST \
-            "{{https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}}}/sendMessage" \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_USER_ID}" \
             -d text="🔴 Hermes run ${{ github.run_id }} FAILED — check Actions logs" > /dev/null || true
