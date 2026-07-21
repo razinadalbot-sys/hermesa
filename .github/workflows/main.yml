@@ -1,4 +1,4 @@
-name: Hermes Agent — Telegram + Local (all tools)
+name: Hermes Agent — Telegram + NVIDIA (all tools)
 
 on:
   workflow_dispatch:
@@ -8,7 +8,9 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  HERMES_MODEL: "tencent/hy3:free"
+  # NVIDIA build.nvidia.com free endpoint (40 RPM)
+  # Model slug: model page > "View Code" > model="..." থেকে হুবহু কপি করুন
+  HERMES_MODEL: "nim/nvidia/nemotron-3-ultra-550b-a55b"
   RUN_MINUTES: 330            # total budget from job start (wait time included)
   HERMES_HOME: /home/runner/.hermes
   DATA_REPO: jahid12525/harmesprivatestorage
@@ -19,6 +21,12 @@ jobs:
     timeout-minutes: 350
 
     steps:
+      # ── A. Free disk space ──
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc || true
+          df -h /
+
       # ── 0. Acquire global lock: only ONE Hermes run anywhere, ever ──
       - name: Acquire global run lock
         env:
@@ -71,7 +79,7 @@ jobs:
           done
           echo "Restored $(du -sh "$HERMES_HOME" 2>/dev/null | cut -f1) of Hermes data"
 
-      # ── 2. Install Hermes Agent (FIX: clean stale install dir first) ──
+      # ── 2. Install Hermes Agent (clean stale install dir first) ──
       - name: Install Hermes Agent
         run: |
           rm -rf "$HERMES_HOME/hermes-agent"
@@ -121,7 +129,7 @@ jobs:
         run: |
           mkdir -p "$HERMES_HOME"
           cat > "$HERMES_HOME/.env" <<EOF
-          OPENROUTER_API_KEY=${{ secrets.OPENROUTER_API_KEY }}
+          NVIDIA_API_KEY=${{ secrets.NVIDIA_API_KEY }}
           TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_ALLOWED_USERS=${{ secrets.TELEGRAM_USER_ID }}
           SEARXNG_URL=http://localhost:8080
@@ -130,9 +138,11 @@ jobs:
           EOF
           chmod 600 "$HERMES_HOME/.env"
 
-      # ── 6. Configure Hermes ──
-      - name: Configure Hermes (model, search, TTS, tools)
+      # ── 6. Configure Hermes (NVIDIA NIM provider) ──
+      - name: Configure Hermes
         run: |
+          hermes config set providers.nim.base_url "https://integrate.api.nvidia.com/v1"
+          hermes config set providers.nim.api_key_env NVIDIA_API_KEY
           hermes config set model "$HERMES_MODEL"
           hermes config set web.search_backend searxng
           hermes config set tts.provider edge
@@ -184,9 +194,9 @@ jobs:
           TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
         run: |
           curl -s -X POST \
-            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            "{{https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}}}/sendMessage" \
             -d chat_id="${TELEGRAM_USER_ID}" \
-            -d text="🟢 Hermes online (run ${{ github.run_id }})" > /dev/null || true
+            -d text="🟢 Hermes online (run ${{ github.run_id }}) — model: ${HERMES_MODEL}" > /dev/null || true
 
       # ── 9. Gateway with crash auto-restart (budget from JOB start) ──
       - name: Run Hermes gateway (Telegram bot)
@@ -201,7 +211,7 @@ jobs:
             sleep 10
           done
 
-      # ── 10. Push data back (FIX: exclude hermes-agent install dir) ──
+      # ── 10. Push data back (exclude hermes-agent install dir) ──
       - name: Push Hermes data to private data repo
         if: always()
         run: |
@@ -245,6 +255,6 @@ jobs:
           TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
         run: |
           curl -s -X POST \
-            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            "{{https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}}}/sendMessage" \
             -d chat_id="${TELEGRAM_USER_ID}" \
             -d text="🔴 Hermes run ${{ github.run_id }} FAILED — check Actions logs" > /dev/null || true
