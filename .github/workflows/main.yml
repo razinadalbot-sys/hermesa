@@ -132,10 +132,18 @@ jobs:
             cooldown_time: 120
           EOF
           nohup litellm --config /tmp/litellm.yaml --port 4000 > /tmp/litellm.log 2>&1 &
+          UP=0
           for i in $(seq 1 30); do
-            curl -fsS http://localhost:4000/health/liveliness >/dev/null 2>&1 && { echo "LiteLLM proxy up"; break; }
+            if curl -fsS http://localhost:4000/health/liveliness >/dev/null 2>&1; then UP=1; break; fi
             sleep 2
           done
+          if [ "$UP" != "1" ]; then
+            echo "❌ LiteLLM failed to start — log:"
+            tail -50 /tmp/litellm.log
+            exit 1
+          fi
+          echo "✅ LiteLLM proxy up — available models:"
+          curl -s http://localhost:4000/v1/models
 
       # ── 5. Secrets → .env ──
       - name: Write Hermes .env
