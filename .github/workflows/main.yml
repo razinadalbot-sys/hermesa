@@ -8,7 +8,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # LiteLLM proxy-র virtual model — আসল মডেল Step 4.5-এর লিস্টে
+  # LiteLLM proxy-র virtual model — আসল মডেলগুলো Step 4.5-এর লিস্টে
   HERMES_MODEL: "nim/smart"
   RUN_MINUTES: 330            # total budget from job start
   HERMES_HOME: /home/runner/.hermes
@@ -81,7 +81,7 @@ jobs:
             sleep 2
           done
 
-      # ── 4.5 LiteLLM proxy: auto failover across ALL NVIDIA free models ──
+      # ── 4.5 LiteLLM proxy: auto failover across NVIDIA free models ──
       - name: Start LiteLLM failover proxy
         env:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
