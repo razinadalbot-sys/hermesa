@@ -8,9 +8,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # NVIDIA build.nvidia.com free endpoint (40 RPM)
-  # Model slug: model page > "View Code" > model="..." থেকে হুবহু কপি করুন
-  HERMES_MODEL: "nim/nvidia/nemotron-3-ultra-550b-a55b"
+  # LiteLLM proxy-র virtual model — আসল মডেল Step 4.5-এর লিস্টে
+  HERMES_MODEL: "nim/smart"
   RUN_MINUTES: 330            # total budget from job start
   HERMES_HOME: /home/runner/.hermes
   DATA_REPO: jahid12525/harmesprivatestorage
@@ -82,6 +81,62 @@ jobs:
             sleep 2
           done
 
+      # ── 4.5 LiteLLM proxy: auto failover across ALL NVIDIA free models ──
+      - name: Start LiteLLM failover proxy
+        env:
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+        run: |
+          pip install -U "litellm[proxy]"
+          cat > /tmp/litellm.yaml <<'EOF'
+          model_list:
+            - model_name: smart
+              litellm_params:
+                model: openai/z-ai/glm-5.2
+                api_base: https://integrate.api.nvidia.com/v1
+                api_key: os.environ/NVIDIA_API_KEY
+            - model_name: smart
+              litellm_params:
+                model: openai/deepseek-ai/deepseek-v4-flash
+                api_base: https://integrate.api.nvidia.com/v1
+                api_key: os.environ/NVIDIA_API_KEY
+            - model_name: smart
+              litellm_params:
+                model: openai/moonshotai/kimi-k2.6
+                api_base: https://integrate.api.nvidia.com/v1
+                api_key: os.environ/NVIDIA_API_KEY
+            - model_name: smart
+              litellm_params:
+                model: openai/nvidia/nemotron-3-super-120b-a12b
+                api_base: https://integrate.api.nvidia.com/v1
+                api_key: os.environ/NVIDIA_API_KEY
+            - model_name: smart
+              litellm_params:
+                model: openai/nvidia/nemotron-3-nano-30b-a3b
+                api_base: https://integrate.api.nvidia.com/v1
+                api_key: os.environ/NVIDIA_API_KEY
+            - model_name: smart
+              litellm_params:
+                model: openai/deepseek-ai/deepseek-v4-pro
+                api_base: https://integrate.api.nvidia.com/v1
+                api_key: os.environ/NVIDIA_API_KEY
+            - model_name: smart
+              litellm_params:
+                model: openai/nvidia/nemotron-3-ultra-550b-a55b
+                api_base: https://integrate.api.nvidia.com/v1
+                api_key: os.environ/NVIDIA_API_KEY
+          litellm_settings:
+            num_retries: 1
+            request_timeout: 300
+          router_settings:
+            allowed_fails: 2
+            cooldown_time: 120
+          EOF
+          nohup litellm --config /tmp/litellm.yaml --port 4000 > /tmp/litellm.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -fsS http://localhost:4000/health/liveliness >/dev/null 2>&1 && { echo "LiteLLM proxy up"; break; }
+            sleep 2
+          done
+
       # ── 5. Secrets → .env ──
       - name: Write Hermes .env
         run: |
@@ -96,10 +151,10 @@ jobs:
           EOF
           chmod 600 "$HERMES_HOME/.env"
 
-      # ── 6. Configure Hermes (NVIDIA NIM provider) ──
+      # ── 6. Configure Hermes (points at local LiteLLM proxy) ──
       - name: Configure Hermes
         run: |
-          hermes config set providers.nim.base_url "https://integrate.api.nvidia.com/v1"
+          hermes config set providers.nim.base_url "http://localhost:4000/v1"
           hermes config set providers.nim.api_key_env NVIDIA_API_KEY
           hermes config set model "$HERMES_MODEL"
           hermes config set web.search_backend searxng
@@ -141,7 +196,7 @@ jobs:
           curl -s -X POST \
             "{{https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}}}/sendMessage" \
             -d chat_id="${TELEGRAM_USER_ID}" \
-            -d text="🟢 Hermes online (run ${{ github.run_id }}) — model: ${HERMES_MODEL}" > /dev/null || true
+            -d text="🟢 Hermes online (run ${{ github.run_id }}) — NVIDIA multi-model failover active" > /dev/null || true
 
       # ── 9. Gateway with crash auto-restart (budget from JOB start) ──
       - name: Run Hermes gateway (Telegram bot)
