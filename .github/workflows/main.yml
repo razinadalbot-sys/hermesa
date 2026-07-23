@@ -8,50 +8,50 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # LiteLLM proxy-র virtual model — আসল মডেলগুলো Step 4.5-এর লিস্টে
-  HERMES_MODEL: "nim/smart"
-  RUN_MINUTES: 330            # total budget from job start
+  RUN_MINUTES: 330
   HERMES_HOME: /home/runner/.hermes
   DATA_REPO: jahid12525/harmesprivatestorage
 
 jobs:
-  hermes:
+  run-agent:
     runs-on: ubuntu-latest
     timeout-minutes: 350
 
     steps:
-      # ── 1. Pull Hermes data (+ reassemble chunked files) ──
-      - name: Pull Hermes data from private data repo
+      # ── 1. Pull persisted data from private repo ──
+      - name: Pull data repo
+        env:
+          DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
         run: |
           date +%s > /tmp/job_start
-          git clone --depth 1 \
-            "https://x-access-token:${{ secrets.DATA_REPO_TOKEN }}@github.com/${DATA_REPO}.git" \
-            "$HERMES_HOME" || mkdir -p "$HERMES_HOME"
-          rm -f "$HERMES_HOME/.env"
-          find "$HERMES_HOME" -name "*.gh-chunk.000" | while read -r first; do
-            base="${first%.gh-chunk.000}"
-            cat "$base".gh-chunk.* > "$base"
-            rm -f "$base".gh-chunk.*
-            echo "Reassembled: $base"
-          done
-          echo "Restored $(du -sh "$HERMES_HOME" 2>/dev/null | cut -f1) of Hermes data"
+          mkdir -p "$HERMES_HOME"
+          git clone --depth 1 "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git" /tmp/data || true
+          if [ -d /tmp/data ]; then
+            rm -f /tmp/data/.env
+            rsync -a --exclude='.git' /tmp/data/ "$HERMES_HOME/" || true
+            find "$HERMES_HOME" -name "*.gh-chunk.000" | while read -r first; do
+              base="${first%.gh-chunk.000}"
+              cat "${base}".gh-chunk.* > "$base"
+              rm -f "${base}".gh-chunk.*
+              echo "Reassembled: $base"
+            done
+          fi
 
-      # ── 2. Install Hermes Agent (clean stale install dir first) ──
+      # ── 2. Install Hermes Agent ──
       - name: Install Hermes Agent
         run: |
           rm -rf "$HERMES_HOME/hermes-agent"
           curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
 
-      # ── 3. SearXNG (JSON API enabled) ──
-      - name: Start SearXNG (free web search backend)
+      # ── 3. Start SearXNG (free web search) ──
+      - name: Start SearXNG
         run: |
-          mkdir -p "$PWD/searxng"
-          SECRET=$(openssl rand -hex 32)
-          cat > "$PWD/searxng/settings.yml" <<EOF
+          mkdir -p /tmp/searxng
+          cat > /tmp/searxng/settings.yml <<'EOF'
           use_default_settings: true
           server:
-            secret_key: "${SECRET}"
+            secret_key: "hermes-searxng-secret"
             limiter: false
           search:
             formats:
@@ -59,201 +59,150 @@ jobs:
               - json
           EOF
           docker run -d --name searxng -p 8080:8080 \
-            -v "$PWD/searxng:/etc/searxng" \
+            -v /tmp/searxng:/etc/searxng \
             searxng/searxng:latest
+          echo "Waiting for SearXNG..."
           for i in $(seq 1 30); do
-            if curl -fsS "http://localhost:8080/search?q=test&format=json" >/dev/null 2>&1; then
-              echo "SearXNG JSON API is up"; exit 0
+            if curl -s "http://localhost:8080/search?q=test&format=json" | grep -q results; then
+              echo "SearXNG is ready"; exit 0
             fi
             sleep 2
           done
-          echo "SearXNG JSON API failed to start"; docker logs searxng; exit 1
+          echo "SearXNG failed to start"; exit 1
 
-      # ── 4. Camoufox ──
-      - name: Install & start Camoufox
+      # ── 4. Start Camoufox (stealth browser) ──
+      - name: Start Camoufox
         run: |
           pip install -U "camoufox[geoip]"
-          python -m camoufox fetch
-          nohup python -c "from camoufox.server import launch_server; launch_server(headless=True, port=9222, ws_path='hermes')" \
-            > camoufox.log 2>&1 &
-          for i in $(seq 1 30); do
-            (exec 3<>/dev/tcp/127.0.0.1/9222) 2>/dev/null && { echo "Camoufox is up"; break; }
-            sleep 2
-          done
+          python3 -m camoufox fetch
+          nohup python3 -c "
+          from camoufox.server import launch_server
+          launch_server(headless=True, port=9222, ws_path='hermes')
+          " > /tmp/camoufox.log 2>&1 &
+          sleep 20
+          echo "Camoufox launched"
 
-      # ── 4.5 LiteLLM proxy: auto failover across NVIDIA free models ──
-      - name: Start LiteLLM failover proxy
+
+      # ── 5. Write .env (NVIDIA_API_KEY included — direct provider mode) ──
+      - name: Write .env
         env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-        run: |
-          pip install -U "litellm[proxy]"
-          cat > /tmp/litellm.yaml <<'EOF'
-          model_list:
-            - model_name: smart
-              litellm_params:
-                model: openai/z-ai/glm-5.2
-                api_base: https://integrate.api.nvidia.com/v1
-                api_key: os.environ/NVIDIA_API_KEY
-            - model_name: smart
-              litellm_params:
-                model: openai/deepseek-ai/deepseek-v4-flash
-                api_base: https://integrate.api.nvidia.com/v1
-                api_key: os.environ/NVIDIA_API_KEY
-            - model_name: smart
-              litellm_params:
-                model: openai/moonshotai/kimi-k2.6
-                api_base: https://integrate.api.nvidia.com/v1
-                api_key: os.environ/NVIDIA_API_KEY
-            - model_name: smart
-              litellm_params:
-                model: openai/nvidia/nemotron-3-super-120b-a12b
-                api_base: https://integrate.api.nvidia.com/v1
-                api_key: os.environ/NVIDIA_API_KEY
-            - model_name: smart
-              litellm_params:
-                model: openai/nvidia/nemotron-3-nano-30b-a3b
-                api_base: https://integrate.api.nvidia.com/v1
-                api_key: os.environ/NVIDIA_API_KEY
-            - model_name: smart
-              litellm_params:
-                model: openai/deepseek-ai/deepseek-v4-pro
-                api_base: https://integrate.api.nvidia.com/v1
-                api_key: os.environ/NVIDIA_API_KEY
-            - model_name: smart
-              litellm_params:
-                model: openai/nvidia/nemotron-3-ultra-550b-a55b
-                api_base: https://integrate.api.nvidia.com/v1
-                api_key: os.environ/NVIDIA_API_KEY
-          litellm_settings:
-            num_retries: 1
-            request_timeout: 300
-          router_settings:
-            allowed_fails: 2
-            cooldown_time: 120
-          EOF
-          nohup litellm --config /tmp/litellm.yaml --port 4000 > /tmp/litellm.log 2>&1 &
-          UP=0
-          for i in $(seq 1 30); do
-            if curl -fsS http://localhost:4000/health/liveliness >/dev/null 2>&1; then UP=1; break; fi
-            sleep 2
-          done
-          if [ "$UP" != "1" ]; then
-            echo "❌ LiteLLM failed to start — log:"
-            tail -50 /tmp/litellm.log
-            exit 1
-          fi
-          echo "✅ LiteLLM proxy up — available models:"
-          curl -s http://localhost:4000/v1/models
-
-      # ── 5. Secrets → .env ──
-      - name: Write Hermes .env
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: |
           mkdir -p "$HERMES_HOME"
           cat > "$HERMES_HOME/.env" <<EOF
-          NVIDIA_API_KEY=${{ secrets.NVIDIA_API_KEY }}
-          TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_ALLOWED_USERS=${{ secrets.TELEGRAM_USER_ID }}
+          TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+          TELEGRAM_ALLOWED_USERS=${TELEGRAM_USER_ID}
           SEARXNG_URL=http://localhost:8080
           CAMOUFOX_URL=ws://127.0.0.1:9222/hermes
-          GROQ_API_KEY=${{ secrets.GROQ_API_KEY }}
+          NVIDIA_API_KEY=${NVIDIA_API_KEY}
+          GROQ_API_KEY=${GROQ_API_KEY}
           EOF
-          chmod 600 "$HERMES_HOME/.env"
 
-      # ── 6. Configure Hermes (points at local LiteLLM proxy) ──
+      # ── 6. Configure Hermes (direct NVIDIA provider — manual /model selection) ──
       - name: Configure Hermes
         run: |
-          hermes config set providers.nim.base_url "http://localhost:4000/v1"
-          hermes config set providers.nim.api_key_env NVIDIA_API_KEY
-          hermes config set model "$HERMES_MODEL"
+          hermes config unset model.base_url || true
+          hermes config unset model.api_key || true
+          hermes config unset providers.nvidia.base_url || true
+          hermes config unset providers.nvidia.api_key_env || true
+          hermes config unset providers.nim.base_url || true
+          hermes config unset providers.nim.api_key_env || true
+          hermes config set model.provider "nvidia"
+          hermes config set model.default "moonshotai/kimi-k2.6"
           hermes config set web.search_backend searxng
           hermes config set tts.provider edge
           hermes config set toolsets '["terminal","files","web","browser","code","vision","tts","memory","skills","delegation","cron"]'
           hermes doctor || true
+          echo "── Final model config ──"
+          hermes config get model || true
 
-      # ── 7. Background loop: data backup every 30 min ──
-      - name: Start periodic backup loop
+      # ── 7. Background backup loop (every 30 min -> backup branch) ──
+      - name: Start backup loop
         env:
           DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
         run: |
-          cat > /tmp/sync.sh <<'SYNC'
+          cat > /tmp/sync.sh <<'EOF'
           #!/bin/bash
-          cd "$HERMES_HOME" || exit 0
-          TMP=$(mktemp -d)
-          rsync -a --exclude '.env' --exclude '.git' --exclude '*.log' --exclude 'hermes-agent' ./ "$TMP/"
-          cd "$TMP"
-          find . -type f -size +90M ! -name "*.gh-chunk.*" | while read -r f; do
-            split -b 90M -d -a 3 "$f" "$f.gh-chunk."; rm "$f"
+          while true; do
+            sleep 1800
+            rm -rf /tmp/backup && mkdir -p /tmp/backup
+            rsync -a --exclude='.env' --exclude='.git' --exclude='*.log' --exclude='hermes-agent' "$HERMES_HOME/" /tmp/backup/
+            cd /tmp/backup
+            find . -type f -size +90M | while read -r f; do
+              split -b 90M -d -a 3 "$f" "$f.gh-chunk."
+              rm -f "$f"
+            done
+            git init -q -b backup
+            git config user.email "bot@hermes" && git config user.name "hermes-bot"
+            git add -A && git commit -q -m "backup $(date -u +%FT%TZ)" || true
+            git push -f "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git" backup 2>/dev/null || true
+            echo "Backup pushed at $(date)"
           done
-          git init -q -b backup
-          git config user.name hermes-runner
-          git config user.email hermes-runner@users.noreply.github.com
-          git remote add origin "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git"
-          git add -A && git commit -qm "mid-run backup $(date -u +%H:%M)" && git push -qf origin backup
-          rm -rf "$TMP"
-          SYNC
+          EOF
           chmod +x /tmp/sync.sh
-          nohup bash -c 'while true; do sleep 1800; /tmp/sync.sh; done' > /tmp/sync.log 2>&1 &
-          echo "Backup loop started"
+          HERMES_HOME="$HERMES_HOME" DATA_REPO="$DATA_REPO" DATA_REPO_TOKEN="$DATA_REPO_TOKEN" nohup /tmp/sync.sh > /tmp/sync.log 2>&1 &
 
-      # ── 8. Notify online ──
-      - name: Notify bot online (Telegram)
+      # ── 8. Notify start on Telegram ──
+      - name: Notify start
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
         run: |
-          curl -s -X POST \
-            "{{https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}}}/sendMessage" \
+          TG_API="https://api.telegram.org"
+          curl -s -X POST "${TG_API}/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_USER_ID}" \
-            -d text="🟢 Hermes online (run ${{ github.run_id }}) — NVIDIA multi-model failover active" > /dev/null || true
+            -d text="🟢 Hermes Agent ONLINE — direct NVIDIA mode (manual model selection)" > /dev/null
 
-      # ── 9. Gateway with crash auto-restart (budget from JOB start) ──
-      - name: Run Hermes gateway (Telegram bot)
+      # ── 9. Run gateway with time budget ──
+      - name: Run Hermes gateway
         run: |
           JOB_START=$(cat /tmp/job_start)
           END=$(( JOB_START + RUN_MINUTES * 60 ))
-          while [ "$(date +%s)" -lt "$END" ]; do
-            REMAIN=$(( (END - $(date +%s)) / 60 ))
-            [ "$REMAIN" -lt 2 ] && break
+          while true; do
+            NOW=$(date +%s)
+            REMAIN=$(( (END - NOW) / 60 ))
+            if [ "$REMAIN" -le 2 ]; then
+              echo "Time budget exhausted"; break
+            fi
+            echo "Starting gateway (${REMAIN}m remaining)..."
             timeout -k 60 "${REMAIN}m" hermes gateway || true
-            echo "Gateway exited — restarting in 10s ($REMAIN min budget left)"
+            echo "Gateway exited, restarting in 10s..."
             sleep 10
           done
 
-      # ── 10. Push data back (exclude hermes-agent install dir) ──
-      - name: Push Hermes data to private data repo
+      # ── 10. Final push to data repo (main) ──
+      - name: Final data push
         if: always()
+        env:
+          DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
         run: |
-          cd "$HERMES_HOME"
-          rm -f .env
-          rm -rf .git
-          rm -rf hermes-agent
+          rm -rf /tmp/final && mkdir -p /tmp/final
+          rsync -a --exclude='.env' --exclude='.git' --exclude='*.log' --exclude='hermes-agent' "$HERMES_HOME/" /tmp/final/ || true
+          cd /tmp/final
+          find . -type f -size +90M | while read -r f; do
+            split -b 90M -d -a 3 "$f" "$f.gh-chunk."
+            rm -f "$f"
+          done
           cat > .gitignore <<'EOF'
           .env
           *.log
-          hermes-agent/
           EOF
-          find . -type f -size +90M ! -name "*.gh-chunk.*" | while read -r f; do
-            split -b 90M -d -a 3 "$f" "$f.gh-chunk."
-            rm "$f"
-            echo "Chunked: $f"
-          done
-          git init -b main
-          git config user.name "hermes-runner"
-          git config user.email "hermes-runner@users.noreply.github.com"
-          git remote add origin \
-            "https://x-access-token:${{ secrets.DATA_REPO_TOKEN }}@github.com/${DATA_REPO}.git"
-          git add -A
-          git commit -m "hermes data sync $(date -u +'%Y-%m-%dT%H:%M:%SZ') (run ${{ github.run_id }})" || echo "Nothing to commit"
-          git push --force origin main
+          git init -q -b main
+          git config user.email "bot@hermes" && git config user.name "hermes-bot"
+          git add -A && git commit -q -m "final save $(date -u +%FT%TZ)" || true
+          git push -f "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git" main
 
       # ── 11. Notify failure ──
-      - name: Notify failure (Telegram)
+      - name: Notify failure
         if: failure()
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
         run: |
-          curl -s -X POST \
-            "{{https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}}}/sendMessage" \
+          TG_API="https://api.telegram.org"
+          curl -s -X POST "${TG_API}/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_USER_ID}" \
-            -d text="🔴 Hermes run ${{ github.run_id }} FAILED — check Actions logs" > /dev/null || true
+            -d text="🔴 Hermes Agent run FAILED — check Actions logs" > /dev/null
