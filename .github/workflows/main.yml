@@ -1,4 +1,4 @@
-name: Hermes Agent — Telegram + NVIDIA (all tools)
+name: Hermes Agent — Telegram + NVIDIA Pool
 
 on:
   workflow_dispatch:
@@ -42,7 +42,7 @@ jobs:
         run: |
           rm -rf "$HERMES_HOME/hermes-agent"
           curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       # ── 3. Start SearXNG (free web search) ──
       - name: Start SearXNG
@@ -70,25 +70,410 @@ jobs:
           done
           echo "SearXNG failed to start"; exit 1
 
-      # ── 4. Start Camoufox (stealth browser) ──
+      # ── 4. Start Camoufox (stealth browser, persistent profile) ──
       - name: Start Camoufox
         run: |
           pip install -U "camoufox[geoip]"
           python3 -m camoufox fetch
+          mkdir -p "$HERMES_HOME/browser-profile"
           nohup python3 -c "
           from camoufox.server import launch_server
-          launch_server(headless=True, port=9222, ws_path='hermes')
+          launch_server(
+              headless=True, port=9222, ws_path='hermes',
+              persistent_context=True,
+              user_data_dir='/home/runner/.hermes/browser-profile',
+              os='windows',
+          )
           " > /tmp/camoufox.log 2>&1 &
           sleep 20
-          echo "Camoufox launched"
+          echo "Camoufox launched with persistent profile"
 
+      # ── 5. Write model pool control panel (NVIDIA only) ──
+      - name: Write control panel
+        run: |
+          pip install -q flask
+          mkdir -p /tmp/panel
+          cat > /tmp/panel/app.py <<'PYEOF'
+          import os, json, subprocess, sys, time, hmac, secrets, urllib.request, urllib.error
+          from flask import Flask, request, jsonify, make_response
 
-      # ── 5. Write .env (NVIDIA_API_KEY included — direct provider mode) ──
+          app = Flask(__name__)
+          TOKEN = os.environ.get("PANEL_TOKEN", "")
+          if len(TOKEN) < 8:
+              print("FATAL: PANEL_TOKEN missing or too short (min 8 chars)")
+              sys.exit(1)
+          SESSION = secrets.token_hex(32)          # random per-run session cookie
+          FAILS = {"n": 0, "until": 0.0}           # brute-force lockout state
+          HERMES_HOME = os.environ.get("HERMES_HOME", "/home/runner/.hermes")
+          POOL = os.path.join(HERMES_HOME, "pool.json")
+          CFG = "/tmp/litellm.yaml"
+          KEY_NAMES = sorted(k for k in os.environ if k.startswith("NVIDIA_KEY_") and os.environ[k])
+          BASE = "https://integrate.api.nvidia.com/v1"
+
+          def authed():
+              return hmac.compare_digest(request.cookies.get("s") or "", SESSION)
+
+          def deny():
+              return "Not Found", 404
+
+          def fetch_models(key):
+              r = urllib.request.Request(BASE + "/models",
+                  headers={"Authorization": "Bearer " + os.environ[key]})
+              with urllib.request.urlopen(r, timeout=30) as resp:
+                  return sorted(m["id"] for m in json.load(resp)["data"])
+
+          def load_pool():
+              try:
+                  return [x for x in json.load(open(POOL)) if x.get("provider") == "nvidia"]
+              except Exception:
+                  return []
+
+          def save_pool(pool):
+              os.makedirs(HERMES_HOME, exist_ok=True)
+              json.dump(pool, open(POOL, "w"), indent=1)
+
+          def write_config(pool):
+              L = ["model_list:"]
+              for it in pool:
+                  for k in KEY_NAMES:
+                      L.append('  - model_name: "%s"' % it["id"])
+                      L.append("    litellm_params:")
+                      L.append('      model: "nvidia_nim/%s"' % it["id"])
+                      L.append("      api_key: os.environ/" + k)
+              L += ["router_settings:",
+                    "  routing_strategy: simple-shuffle",
+                    "  num_retries: 3",
+                    "  retry_after: 5",
+                    "  allowed_fails: 2",
+                    "  cooldown_time: 120"]
+              # fallbacks: each model falls back to up to 2 other pool models
+              fb = []
+              for it in pool:
+                  others = [x["id"] for x in pool if x["id"] != it["id"]]
+                  if others:
+                      fb.append('    - {"%s": ["%s"]}' % (it["id"], '", "'.join(others[:2])))
+              if fb:
+                  L.append("  fallbacks:")
+                  L += fb
+              L += ["litellm_settings:",
+                    "  drop_params: true"]
+              open(CFG, "w").write("\n".join(L) + "\n")
+
+          LOGIN = """<!doctype html><html><head><meta charset=utf-8>
+          <meta name=viewport content="width=device-width,initial-scale=1">
+          <title>Hermes Panel — Login</title><style>
+          body{font-family:system-ui,sans-serif;background:#0b0e14;color:#e6edf3;display:flex;
+            align-items:center;justify-content:center;min-height:100vh;margin:0}
+          .box{background:#141922;border:1px solid #232b38;border-radius:16px;padding:36px;
+            width:340px;text-align:center}
+          h1{font-size:18px;margin:0 0 6px}
+          p{color:#8b98a9;font-size:13px;margin:0 0 22px}
+          input{width:100%;box-sizing:border-box;background:#0f1420;border:1px solid #232b38;
+            border-radius:10px;color:#e6edf3;padding:13px 14px;font-size:15px;outline:none;margin-bottom:14px}
+          input:focus{border-color:#2dd4bf}
+          button{width:100%;border:0;border-radius:10px;padding:13px;font-size:15px;font-weight:600;
+            background:#2dd4bf;color:#04211c;cursor:pointer}
+          #err{color:#ef4444;font-size:13px;min-height:18px;margin-top:12px}
+          </style></head><body><div class=box>
+          <h1>🎛️ Hermes Model Pool</h1><p>Enter panel password</p>
+          <form onsubmit="go(event)">
+            <input type=password id=pw placeholder="Password" autofocus>
+            <button>Unlock</button>
+          </form><div id=err></div>
+          <script>
+          async function go(e){e.preventDefault();
+            const r=await fetch('/login',{method:'POST',
+              headers:{'Content-Type':'application/json'},
+              body:JSON.stringify({password:document.getElementById('pw').value})})
+              .then(x=>x.json()).catch(()=>({ok:false,msg:'network error'}));
+            if(r.ok)location.reload();
+            else document.getElementById('err').textContent=r.msg;
+          }
+          </script></div></body></html>"""
+
+          HTML = """<!doctype html><html><head><meta charset=utf-8>
+          <meta name=viewport content="width=device-width,initial-scale=1">
+          <title>Hermes Model Pool</title><style>
+          :root{--bg:#0b0e14;--card:#141922;--line:#232b38;--txt:#e6edf3;--dim:#8b98a9;--acc:#2dd4bf;--ok:#22c55e;--bad:#ef4444}
+          *{box-sizing:border-box}
+          body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;background:var(--bg);color:var(--txt);margin:0;padding-bottom:90px}
+          header{padding:18px 24px;border-bottom:1px solid var(--line);display:flex;align-items:baseline;gap:14px;flex-wrap:wrap}
+          header h1{font-size:18px;margin:0}
+          .sub{color:var(--dim);font-size:13px}
+          .wrap{padding:16px 24px;max-width:760px;margin:0 auto}
+          .card{background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden}
+          .card h2{font-size:14px;margin:0;padding:13px 16px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center}
+          .badge{background:#1d2634;color:var(--dim);font-size:12px;padding:2px 10px;border-radius:99px}
+          .search{width:100%;background:#0f1420;border:none;border-bottom:1px solid var(--line);color:var(--txt);padding:10px 16px;font-size:13px;outline:none}
+          .list{max-height:62vh;overflow-y:auto;padding:8px}
+          .row{display:flex;align-items:center;gap:10px;padding:7px 10px;border-radius:10px;margin:2px 0}
+          .row:hover{background:#1a212e}
+          .row.sel{background:#0f2e2a;outline:1px solid #14532d}
+          .row input{accent-color:var(--acc);width:16px;height:16px;flex:none;cursor:pointer}
+          .name{flex:1;font-size:13.5px;font-family:ui-monospace,monospace;word-break:break-all}
+          .tbtn{background:#1d2634;color:#9fb3c8;border:1px solid var(--line);border-radius:8px;padding:4px 12px;font-size:12px;cursor:pointer;flex:none}
+          .tbtn:hover{border-color:var(--acc);color:var(--acc)}
+          .chip{font-size:11px;padding:2px 8px;border-radius:99px;flex:none;white-space:nowrap}
+          .chip.ok{background:#052e1b;color:var(--ok)}
+          .chip.bad{background:#3a0d0d;color:var(--bad);cursor:help}
+          footer{position:fixed;left:0;right:0;bottom:0;background:#10151f;border-top:1px solid var(--line);display:flex;gap:12px;align-items:center;padding:13px 24px;z-index:5}
+          .info{flex:1;color:var(--dim);font-size:13px}
+          .btn{border:0;border-radius:10px;padding:12px 22px;font-size:14px;font-weight:600;cursor:pointer}
+          .btn.primary{background:var(--acc);color:#04211c}
+          .btn.ghost{background:#1d2634;color:var(--txt);border:1px solid var(--line)}
+          #toast{position:fixed;top:16px;right:16px;background:#1d2634;border:1px solid var(--line);border-left:4px solid var(--acc);padding:12px 16px;border-radius:10px;font-size:13px;display:none;max-width:380px;z-index:9}
+          </style></head><body>
+          <header><h1>🎛️ Hermes Model Pool</h1><span class=sub id=sub>Loading catalog…</span></header>
+          <div class=wrap>
+            <div class=card><h2>NVIDIA NIM <span class=badge id=cnt>–</span></h2>
+              <input class=search placeholder="Filter models… (tip: search 'instruct')" oninput="filt(this.value)">
+              <div class=list id=nvidia></div></div>
+          </div>
+          <footer>
+            <div class=info id=info>0 selected</div>
+            <button class="btn ghost" onclick="testSelected()">⚡ Test selected</button>
+            <button class="btn primary" onclick="applyPool()">✅ Apply pool</button>
+          </footer>
+          <div id=toast></div>
+          <script>
+          let cat=[],pool=new Set(),results={},filter='';
+          function toast(m,bad){const t=document.getElementById('toast');t.textContent=m;
+            t.style.borderLeftColor=bad?'#ef4444':'#2dd4bf';t.style.display='block';
+            clearTimeout(t._h);t._h=setTimeout(()=>t.style.display='none',6000)}
+          fetch('/api/models').then(r=>r.json()).then(d=>{
+            cat=d.nvidia;
+            d.pool.forEach(x=>pool.add(x.id));
+            render();info();
+            document.getElementById('sub').textContent=d.errors.length?d.errors.join(' | ')
+              :'Live catalog loaded. Tick chat/instruct models, Test, then Apply.';
+            if(d.errors.length)toast(d.errors.join(' | '),true);
+          });
+          function render(){
+            const f=filter.toLowerCase();
+            const items=cat.filter(m=>m.toLowerCase().includes(f));
+            document.getElementById('cnt').textContent=cat.length;
+            document.getElementById('nvidia').innerHTML=items.map(m=>{
+              const r=results[m],sel=pool.has(m);
+              const chip=!r?'':r.loading?'<span class=chip>testing…</span>'
+                :r.ok?`<span class="chip ok">✓ ${r.ms}ms</span>`
+                :`<span class="chip bad" title="${(r.msg||'').replace(/"/g,'&quot;')}">✗ ${(r.msg||'fail').slice(0,28)}</span>`;
+              return `<div class="row ${sel?'sel':''}">
+                <input type=checkbox ${sel?'checked':''} onchange="tog('${m}')">
+                <span class=name>${m}</span>${chip}
+                <button class=tbtn onclick="testModel('${m}')">Test</button></div>`;
+            }).join('')||'<div style="padding:14px;color:#8b98a9">No models</div>';
+          }
+          function filt(v){filter=v;render()}
+          function tog(m){pool.has(m)?pool.delete(m):pool.add(m);render();info()}
+          function info(){document.getElementById('info').textContent=pool.size+' model(s) selected'}
+          async function testModel(m){
+            results[m]={loading:true};render();
+            const r=await fetch('/api/test',{method:'POST',
+              headers:{'Content-Type':'application/json'},
+              body:JSON.stringify({id:m})}).then(x=>x.json())
+              .catch(e=>({ok:false,ms:0,msg:'timeout / connection dropped'}));
+            results[m]=r;render();
+            toast((r.ok?'✅ ':'❌ ')+m+' — '+(r.ok?r.ms+'ms':r.msg),!r.ok);
+            return r;
+          }
+          async function testSelected(){
+            const items=[...pool];
+            if(!items.length)return toast('Nothing selected',true);
+            toast('Testing '+items.length+' model(s) one by one…');
+            let ok=0;
+            for(const m of items){const r=await testModel(m);if(r.ok)ok++}
+            toast(`Done: ${ok}/${items.length} working`);
+          }
+          function applyPool(){
+            const sel=[...pool].map(m=>({provider:'nvidia',id:m}));
+            if(!sel.length)return toast('Select at least 1 model',true);
+            toast('Applying pool…');
+            fetch('/api/pool',{method:'POST',
+              headers:{'Content-Type':'application/json'},
+              body:JSON.stringify({pool:sel})}).then(r=>r.json())
+              .then(d=>toast('✅ Pool saved ('+d.count+'). Router restarting ~10s. Run /model in Telegram to switch.'))
+              .catch(e=>toast('Failed: '+e,true));
+          }
+          </script></body></html>"""
+
+          @app.route("/")
+          def home():
+              return (HTML, 200) if authed() else (LOGIN, 200)
+
+          @app.route("/login", methods=["POST"])
+          def login():
+              now = time.time()
+              if now < FAILS["until"]:
+                  return jsonify({"ok": False, "msg": "Too many attempts — wait 60s"})
+              pw = (request.get_json(silent=True) or {}).get("password", "")
+              if hmac.compare_digest(pw, TOKEN):
+                  FAILS["n"] = 0
+                  r = make_response(jsonify({"ok": True}))
+                  r.set_cookie("s", SESSION, httponly=True, secure=True,
+                               samesite="Lax", max_age=6 * 3600)
+                  return r
+              FAILS["n"] += 1
+              if FAILS["n"] >= 5:
+                  FAILS["until"] = now + 60
+                  FAILS["n"] = 0
+              time.sleep(1)
+              return jsonify({"ok": False, "msg": "Wrong password"})
+
+          @app.route("/api/models")
+          def models():
+              if not authed(): return deny()
+              out = {"nvidia": [], "errors": [], "pool": load_pool()}
+              if KEY_NAMES:
+                  try: out["nvidia"] = fetch_models(KEY_NAMES[0])
+                  except Exception as e: out["errors"].append("nvidia: " + str(e))
+              else:
+                  out["errors"].append("no NVIDIA keys configured")
+              return jsonify(out)
+
+          @app.route("/api/test", methods=["POST"])
+          def test_model():
+              if not authed(): return deny()
+              mid = request.get_json()["id"]
+              if not KEY_NAMES:
+                  return jsonify({"ok": False, "ms": 0, "msg": "no API keys configured"})
+              body = json.dumps({"model": mid, "max_tokens": 5,
+                  "messages": [{"role": "user", "content": "Say OK"}]}).encode()
+              req = urllib.request.Request(BASE + "/chat/completions", data=body,
+                  headers={"Authorization": "Bearer " + os.environ[KEY_NAMES[0]],
+                           "Content-Type": "application/json"})
+              t0 = time.time()
+              try:
+                  with urllib.request.urlopen(req, timeout=45) as r:
+                      json.load(r)
+                  return jsonify({"ok": True, "ms": int((time.time()-t0)*1000), "msg": "works"})
+              except urllib.error.HTTPError as e:
+                  try:
+                      err = json.loads(e.read().decode())
+                      msg = (err.get("error") or {}).get("message") or err.get("title") or str(err)
+                  except Exception:
+                      msg = "HTTP %d" % e.code
+                  return jsonify({"ok": False, "ms": int((time.time()-t0)*1000), "msg": str(msg)[:200]})
+              except Exception as e:
+                  return jsonify({"ok": False, "ms": int((time.time()-t0)*1000), "msg": str(e)[:200]})
+
+          @app.route("/api/pool", methods=["POST"])
+          def set_pool():
+              if not authed(): return deny()
+              pool = [x for x in request.get_json()["pool"] if x.get("provider") == "nvidia"]
+              if not pool:
+                  return jsonify({"ok": False, "count": 0})
+              save_pool(pool)
+              write_config(pool)
+              # fire-and-forget restart: respond immediately, don't block the request
+              subprocess.Popen(["docker", "restart", "litellm"],
+                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              return jsonify({"ok": True, "count": len(pool)})
+
+          if __name__ == "__main__":
+              if "--init" in sys.argv:
+                  write_config(load_pool()); sys.exit(0)
+              app.run(host="0.0.0.0", port=7000, threaded=True)
+          PYEOF
+
+          # sanitize pool: drop any old ollama entries from backup; default if empty
+          python3 - <<'PY'
+          import json, os
+          home = os.environ.get("HERMES_HOME", "/home/runner/.hermes")
+          p = os.path.join(home, "pool.json")
+          try:
+              pool = [x for x in json.load(open(p)) if x.get("provider") == "nvidia"]
+          except Exception:
+              pool = []
+          if not pool:
+              pool = [{"provider": "nvidia", "id": "meta/llama-3.3-70b-instruct"}]
+          os.makedirs(home, exist_ok=True)
+          json.dump(pool, open(p, "w"), indent=1)
+          print("pool:", [x["id"] for x in pool])
+          PY
+
+      # ── 6. Start LiteLLM router + panel + tunnel ──
+      - name: Start LiteLLM router and control panel
+        env:
+          PANEL_TOKEN: ${{ secrets.PANEL_TOKEN }}
+          NVIDIA_KEYS: ${{ secrets.NVIDIA_KEYS }}
+        run: |
+          # ── hard fail if PANEL_TOKEN is missing or too short ──
+          if [ -z "$PANEL_TOKEN" ] || [ ${#PANEL_TOKEN} -lt 8 ]; then
+            echo "::error::PANEL_TOKEN secret is missing or shorter than 8 chars — set it in Settings → Secrets"
+            exit 1
+          fi
+
+          # ── split bulk NVIDIA_KEYS into numbered env vars ──
+          : > /tmp/litellm.env
+          n=0
+          while IFS= read -r k; do
+            k=$(echo "$k" | tr -d ' \r')
+            [ -z "$k" ] && continue
+            n=$((n+1))
+            echo "NVIDIA_KEY_${n}=${k}" >> /tmp/litellm.env
+          done < <(echo "$NVIDIA_KEYS" | tr ',' '\n')
+          echo "Loaded $n NVIDIA key(s)"
+          if [ "$n" -eq 0 ]; then
+            echo "::error::NVIDIA_KEYS secret is empty — add at least one key"
+            exit 1
+          fi
+
+          # make the split keys visible to this shell + panel process
+          set -a; source /tmp/litellm.env; set +a
+
+          # generate initial litellm config from current pool
+          python3 /tmp/panel/app.py --init
+
+          docker run -d --name litellm --network host \
+            --env-file /tmp/litellm.env \
+            -v /tmp/litellm.yaml:/app/config.yaml \
+            ghcr.io/berriai/litellm:main-latest \
+            --config /app/config.yaml --port 4000
+
+          rm -f /tmp/litellm.env   # keys now live only in container/process env
+
+          # start control panel (inherits this step's env)
+          nohup python3 /tmp/panel/app.py > /tmp/panel.log 2>&1 &
+          sleep 3
+          # verify panel is up (login page must load)
+          curl -fs http://localhost:7000/ >/dev/null || { cat /tmp/panel.log; exit 1; }
+
+          echo "Waiting for LiteLLM..."
+          for i in $(seq 1 30); do
+            curl -fs http://localhost:4000/v1/models >/dev/null 2>&1 && break
+            sleep 3
+          done
+          curl -fs http://localhost:4000/v1/models || { docker logs litellm; exit 1; }
+
+          # cloudflare quick tunnel for the panel
+          sudo curl -fsSL \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -o /usr/local/bin/cloudflared
+          sudo chmod +x /usr/local/bin/cloudflared
+          nohup cloudflared tunnel --no-autoupdate --url http://localhost:7000 > /tmp/tunnel.log 2>&1 &
+          URL=""
+          for i in $(seq 1 30); do
+            URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/tunnel.log | head -n1 || true)
+            [ -n "$URL" ] && break
+            sleep 2
+          done
+          if [ -z "$URL" ]; then echo "Tunnel failed"; cat /tmp/tunnel.log; exit 1; fi
+          PANEL_URL="${URL}"
+          echo "PANEL_URL=$PANEL_URL" >> "$GITHUB_ENV"
+          echo "=================================================="
+          echo "🎛️  MODEL POOL CONTROL PANEL:"
+          echo ""
+          echo "    $PANEL_URL"
+          echo ""
+          echo "    (password = your PANEL_TOKEN secret)"
+          echo "=================================================="
+          echo "::notice title=🎛️ Model Pool Panel::$PANEL_URL (password = PANEL_TOKEN secret)"
+
+      # ── 7. Write .env ──
       - name: Write .env
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
-          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: |
           mkdir -p "$HERMES_HOME"
@@ -97,21 +482,42 @@ jobs:
           TELEGRAM_ALLOWED_USERS=${TELEGRAM_USER_ID}
           SEARXNG_URL=http://localhost:8080
           CAMOUFOX_URL=ws://127.0.0.1:9222/hermes
-          NVIDIA_API_KEY=${NVIDIA_API_KEY}
           GROQ_API_KEY=${GROQ_API_KEY}
           EOF
 
-      # ── 6. Configure Hermes (direct NVIDIA provider — manual /model selection) ──
+      # ── 8. Standing instructions for the agent (auto save-to-file) ──
+      - name: Write agent instructions
+        run: |
+          mkdir -p "$HERMES_HOME/work"
+          cat > "$HOME/AGENTS.md" <<'EOF'
+          # Standing instructions
+          - For any long or multi-step task (scraping, research, data
+            collection, comparisons), IMMEDIATELY append each intermediate
+            result to a file under ~/.hermes/work/ as you go. Never keep
+            results only in the conversation.
+          - Use one file per task, named by date and topic
+            (e.g. ~/.hermes/work/2026-07-25-price-scrape.md).
+          - When the task finishes, tell the user the file path.
+          - These files are backed up automatically; treat them as the
+            source of truth for task results.
+          EOF
+          echo "Agent instructions written to $HOME/AGENTS.md"
+
+      # ── 9. Configure Hermes (default model comes FROM YOUR POOL) ──
       - name: Configure Hermes
         run: |
-          hermes config unset model.base_url || true
-          hermes config unset model.api_key || true
           hermes config unset providers.nvidia.base_url || true
           hermes config unset providers.nvidia.api_key_env || true
           hermes config unset providers.nim.base_url || true
           hermes config unset providers.nim.api_key_env || true
-          hermes config set model.provider "nvidia"
-          hermes config set model.default "moonshotai/kimi-k2.6"
+          hermes config set model.provider custom
+          hermes config set model.base_url "http://localhost:4000/v1"
+          hermes config set model.api_key "sk-local"
+          # ★ FIX: default model = first model in YOUR saved pool (not hardcoded)
+          DEFAULT_MODEL=$(python3 -c "import json; print(json.load(open('$HERMES_HOME/pool.json'))[0]['id'])")
+          echo "Default model from pool: $DEFAULT_MODEL"
+          hermes config set model.default "$DEFAULT_MODEL"
+          hermes config set model.context_length 65536
           hermes config set web.search_backend searxng
           hermes config set tts.provider edge
           hermes config set toolsets '["terminal","files","web","browser","code","vision","tts","memory","skills","delegation","cron"]'
@@ -119,7 +525,7 @@ jobs:
           echo "── Final model config ──"
           hermes config get model || true
 
-      # ── 7. Background backup loop (every 30 min -> backup branch) ──
+      # ── 10. Background backup loop (every 30 min -> backup branch) ──
       - name: Start backup loop
         env:
           DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
@@ -129,7 +535,10 @@ jobs:
           while true; do
             sleep 1800
             rm -rf /tmp/backup && mkdir -p /tmp/backup
-            rsync -a --exclude='.env' --exclude='.git' --exclude='*.log' --exclude='hermes-agent' "$HERMES_HOME/" /tmp/backup/
+            rsync -a --exclude='.env' --exclude='.git' --exclude='*.log' --exclude='hermes-agent' \
+              --exclude='browser-profile/cache2' --exclude='browser-profile/startupCache' \
+              --exclude='browser-profile/shader-cache' \
+              "$HERMES_HOME/" /tmp/backup/
             cd /tmp/backup
             find . -type f -size +90M | while read -r f; do
               split -b 90M -d -a 3 "$f" "$f.gh-chunk."
@@ -143,9 +552,10 @@ jobs:
           done
           EOF
           chmod +x /tmp/sync.sh
-          HERMES_HOME="$HERMES_HOME" DATA_REPO="$DATA_REPO" DATA_REPO_TOKEN="$DATA_REPO_TOKEN" nohup /tmp/sync.sh > /tmp/sync.log 2>&1 &
+          HERMES_HOME="$HERMES_HOME" DATA_REPO="$DATA_REPO" DATA_REPO_TOKEN="$DATA_REPO_TOKEN" \
+            nohup /tmp/sync.sh > /tmp/sync.log 2>&1 &
 
-      # ── 8. Notify start on Telegram ──
+      # ── 11. Notify start on Telegram (includes panel link) ──
       - name: Notify start
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -154,9 +564,12 @@ jobs:
           TG_API="https://api.telegram.org"
           curl -s -X POST "${TG_API}/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_USER_ID}" \
-            -d text="🟢 Hermes Agent ONLINE — direct NVIDIA mode (manual model selection)" > /dev/null
+            -d text="🟢 Hermes Agent ONLINE (NVIDIA pool)
+          🎛️ Model panel: ${PANEL_URL}
+          🔑 Password: your PANEL_TOKEN secret
+          Use /model in Telegram to pick from the pool" > /dev/null
 
-      # ── 9. Run gateway with time budget ──
+      # ── 12. Run gateway with time budget ──
       - name: Run Hermes gateway
         run: |
           JOB_START=$(cat /tmp/job_start)
@@ -173,14 +586,17 @@ jobs:
             sleep 10
           done
 
-      # ── 10. Final push to data repo (main) ──
+      # ── 13. Final push to data repo (main) ──
       - name: Final data push
         if: always()
         env:
           DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
         run: |
           rm -rf /tmp/final && mkdir -p /tmp/final
-          rsync -a --exclude='.env' --exclude='.git' --exclude='*.log' --exclude='hermes-agent' "$HERMES_HOME/" /tmp/final/ || true
+          rsync -a --exclude='.env' --exclude='.git' --exclude='*.log' --exclude='hermes-agent' \
+            --exclude='browser-profile/cache2' --exclude='browser-profile/startupCache' \
+            --exclude='browser-profile/shader-cache' \
+            "$HERMES_HOME/" /tmp/final/ || true
           cd /tmp/final
           find . -type f -size +90M | while read -r f; do
             split -b 90M -d -a 3 "$f" "$f.gh-chunk."
@@ -195,7 +611,7 @@ jobs:
           git add -A && git commit -q -m "final save $(date -u +%FT%TZ)" || true
           git push -f "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git" main
 
-      # ── 11. Notify failure ──
+      # ── 14. Notify failure ──
       - name: Notify failure
         if: failure()
         env:
