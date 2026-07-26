@@ -128,15 +128,15 @@ jobs:
           def deny():
               return "Not Found", 404
 
-          def fetch_models(key):
-              r = urllib.request.Request(BASE + "/models",
+          def fetch_models(base, key):
+              r = urllib.request.Request(base + "/models",
                   headers={"Authorization": "Bearer " + os.environ[key]})
               with urllib.request.urlopen(r, timeout=30) as resp:
-                  return sorted(m["id"] for m in json.load(resp)["data"])
+                  return sorted(set(m["id"] for m in json.load(resp)["data"]))
 
           def load_pool():
               try:
-                  return [x for x in json.load(open(POOL)) if x.get("provider") == "nvidia"]
+                  return [x for x in json.load(open(POOL)) if x.get("provider") in ("nvidia", "mistral")]
               except Exception:
                   return []
 
@@ -146,21 +146,23 @@ jobs:
 
           def write_config(pool):
               L = ["model_list:"]
+              def dep(alias, provider, mid):
+                  keys = KEY_NAMES if provider == "nvidia" else MISTRAL_KEY_NAMES
+                  prefix = "nvidia_nim/" if provider == "nvidia" else "mistral/"
+                  rpm = "40" if provider == "nvidia" else "30"
+                  for k in keys:
+                      L.append('  - model_name: "%s"' % alias)
+                      L.append("    litellm_params:")
+                      L.append('      model: "%s%s"' % (prefix, mid))
+                      L.append("      api_key: os.environ/" + k)
+                      L.append("      rpm: " + rpm)
               for it in pool:
-                  for k in KEY_NAMES:
-                      L.append('  - model_name: "%s"' % it["id"])
-                      L.append("    litellm_params:")
-                      L.append('      model: "nvidia_nim/%s"' % it["id"])
-                      L.append("      api_key: os.environ/" + k)
-                      L.append("      rpm: 40")
-              # Mistral: one entry per model per key (round-robin across keys)
-              for m in MISTRAL_MODELS:
-                  for k in MISTRAL_KEY_NAMES:
-                      L.append('  - model_name: "%s"' % m)
-                      L.append("    litellm_params:")
-                      L.append('      model: "mistral/%s"' % m)
-                      L.append("      api_key: os.environ/" + k)
-                      L.append("      rpm: 30")
+                  # each selected model is callable by its own name...
+                  dep(it["id"], it["provider"], it["id"])
+                  # ...AND is a deployment of the auto-rotating "pool-auto" group:
+                  # every request to pool-auto round-robins across ALL selected
+                  # models x ALL keys automatically (no manual switching)
+                  dep("pool-auto", it["provider"], it["id"])
               L += ["router_settings:",
                     "  routing_strategy: simple-shuffle",
                     "  num_retries: 5",
@@ -317,15 +319,23 @@ jobs:
             <div class=grid id=stats>
               <div class=skel></div><div class=skel></div><div class=skel></div><div class=skel></div>
             </div>
-            <div class=card>
+            <div class=card style="margin-bottom:18px">
               <div class=chead>
-                <h2>&#128225; NVIDIA NIM Catalog</h2><span class=badge id=cnt>&ndash;</span>
+                <h2>&#128225; NVIDIA NIM Catalog</h2><span class=badge id=cntN>&ndash;</span>
                 <button class=chip id=selchip onclick="selOnlyTgl()">Selected only</button>
               </div>
               <div class=sbox><span class=ico>&#128269;</span>
                 <input class=search placeholder="Filter models... try 'instruct' or 'llama'" oninput="filt(this.value)"></div>
               <div class=list id=nvidia>
                 <div class=skel></div><div class=skel></div><div class=skel></div><div class=skel></div><div class=skel></div>
+              </div>
+            </div>
+            <div class=card>
+              <div class=chead>
+                <h2>&#127756; Mistral Catalog</h2><span class=badge id=cntM>&ndash;</span>
+              </div>
+              <div class=list id=mistral style="max-height:34vh">
+                <div class=skel></div><div class=skel></div>
               </div>
             </div>
           </div>
@@ -339,7 +349,7 @@ jobs:
           </footer>
           <div id=toasts></div>
           <script>
-          let cat=[],pool=new Set(),results={},filter='',selOnly=false,keys={};
+          let catN=[],catM=[],pool=new Map(),results={},filter='',selOnly=false,keys={};
           function toast(m,bad){const w=document.getElementById('toasts');
             const t=document.createElement('div');t.className='toast'+(bad?' bad':'');
             t.textContent=(bad?'\u2715 ':'\u2713 ')+m;w.appendChild(t);
@@ -351,68 +361,77 @@ jobs:
                 <div class=v>${n}</div><div class=s>API key${n===1?'':'s'} loaded</div></div>`).join('');
             document.getElementById('stats').innerHTML=rows+`
               <div class=stat><div class=bar style="background:linear-gradient(90deg,var(--acc2),transparent)"></div>
-                <div class=k>Catalog</div><div class=v>${cat.length}</div><div class=s>models available</div></div>
+                <div class=k>Catalog</div><div class=v>${catN.length+catM.length}</div><div class=s>models available</div></div>
               <div class=stat><div class=bar style="background:linear-gradient(90deg,var(--acc),transparent)"></div>
-                <div class=k>Active pool</div><div class=v id=poolstat>${pool.size}</div><div class=s>models in router</div></div>`;
+                <div class=k>Active pool</div><div class=v id=poolstat>${pool.size}</div><div class=s>rotating via pool-auto</div></div>`;
           }
           fetch('/api/models').then(r=>r.json()).then(d=>{
-            cat=d.nvidia;keys=d.keys||{};
-            d.pool.forEach(x=>pool.add(x.id));
+            catN=d.nvidia;catM=d.mistral||[];keys=d.keys||{};
+            d.pool.forEach(x=>pool.set(x.id,x.provider||'nvidia'));
             renderStats();render();info();
             document.getElementById('sub').textContent=d.errors.length?d.errors.join(' | ')
               :'Live \u00b7 catalog loaded';
             if(d.errors.length)toast(d.errors.join(' | '),true);
           });
+          function rowHtml(m,p){
+            const r=results[m],sel=pool.has(m),v=p==='mistral'?'mistral':(m.includes('/')?m.split('/')[0]:'nim');
+            const chip=!r?'':r.loading?'<span class="lat tst">testing\u2026</span>'
+              :r.ok?`<span class="lat ok">${r.ms} ms</span>`
+              :`<span class="lat bad" title="${(r.msg||'').replace(/"/g,'&quot;')}">\u2715 ${(r.msg||'fail').slice(0,24)}</span>`;
+            return `<div class="row ${sel?'sel':''}">
+              <input type=checkbox ${sel?'checked':''} onchange="tog('${m}','${p}')">
+              <span class=vend>${v}</span>
+              <span class=name>${m}</span>${chip}
+              <button class=tbtn onclick="testModel('${m}','${p}')">Test</button></div>`;
+          }
           function render(){
             const f=filter.toLowerCase();
-            let items=cat.filter(m=>m.toLowerCase().includes(f));
+            let items=catN.filter(m=>m.toLowerCase().includes(f));
             if(selOnly)items=items.filter(m=>pool.has(m));
-            document.getElementById('cnt').textContent=cat.length;
-            document.getElementById('nvidia').innerHTML=items.map(m=>{
-              const r=results[m],sel=pool.has(m),v=m.includes('/')?m.split('/')[0]:'nim';
-              const chip=!r?'':r.loading?'<span class="lat tst">testing\u2026</span>'
-                :r.ok?`<span class="lat ok">${r.ms} ms</span>`
-                :`<span class="lat bad" title="${(r.msg||'').replace(/"/g,'&quot;')}">\u2715 ${(r.msg||'fail').slice(0,24)}</span>`;
-              return `<div class="row ${sel?'sel':''}">
-                <input type=checkbox ${sel?'checked':''} onchange="tog('${m}')">
-                <span class=vend>${v}</span>
-                <span class=name>${m}</span>${chip}
-                <button class=tbtn onclick="testModel('${m}')">Test</button></div>`;
-            }).join('')||'<div style="padding:22px;color:#8b98ad;text-align:center">No models match</div>';
+            document.getElementById('cntN').textContent=catN.length;
+            document.getElementById('nvidia').innerHTML=items.map(m=>rowHtml(m,'nvidia')).join('')
+              ||'<div style="padding:22px;color:#8b98ad;text-align:center">No models match</div>';
+            document.getElementById('cntM').textContent=catM.length;
+            let mitems=catM.filter(m=>m.toLowerCase().includes(f));
+            if(selOnly)mitems=mitems.filter(m=>pool.has(m));
+            document.getElementById('mistral').innerHTML=catM.length
+              ?(mitems.map(m=>rowHtml(m,'mistral')).join('')
+                ||'<div style="padding:22px;color:#8b98ad;text-align:center">No models match</div>')
+              :'<div style="padding:22px;color:#8b98ad;text-align:center">No MISTRAL_KEYS secret configured \u2014 add it to enable this section</div>';
           }
           function filt(v){filter=v;render()}
           function selOnlyTgl(){selOnly=!selOnly;document.getElementById('selchip').classList.toggle('on',selOnly);render()}
-          function tog(m){pool.has(m)?pool.delete(m):pool.add(m);render();info();
-            const p=document.getElementById('poolstat');if(p)p.textContent=pool.size}
-          function info(){document.getElementById('info').innerHTML='<b>'+pool.size+'</b> model'+(pool.size===1?'':'s')+' selected'}
+          function tog(m,p){pool.has(m)?pool.delete(m):pool.set(m,p);render();info();
+            const el=document.getElementById('poolstat');if(el)el.textContent=pool.size}
+          function info(){document.getElementById('info').innerHTML='<b>'+pool.size+'</b> model'+(pool.size===1?'':'s')+' in rotating pool'}
           function prog(p){document.getElementById('prog').style.width=p+'%'}
-          async function testModel(m){
+          async function testModel(m,p){
             results[m]={loading:true};render();
             const r=await fetch('/api/test',{method:'POST',
               headers:{'Content-Type':'application/json'},
-              body:JSON.stringify({id:m})}).then(x=>x.json())
+              body:JSON.stringify({id:m,provider:p})}).then(x=>x.json())
               .catch(e=>({ok:false,ms:0,msg:'timeout / connection dropped'}));
             results[m]=r;render();
             toast(m+' \u2014 '+(r.ok?r.ms+' ms':r.msg),!r.ok);
             return r;
           }
           async function testSelected(){
-            const items=[...pool];
+            const items=[...pool.entries()];
             if(!items.length)return toast('Nothing selected',true);
             toast('Testing '+items.length+' model(s)\u2026');
             let ok=0,done=0;
-            for(const m of items){const r=await testModel(m);if(r.ok)ok++;done++;prog(Math.round(done/items.length*100))}
+            for(const [m,p] of items){const r=await testModel(m,p);if(r.ok)ok++;done++;prog(Math.round(done/items.length*100))}
             toast('Done: '+ok+'/'+items.length+' working',ok<items.length);
             setTimeout(()=>prog(0),1500);
           }
           function applyPool(){
-            const sel=[...pool].map(m=>({provider:'nvidia',id:m}));
+            const sel=[...pool.entries()].map(([id,provider])=>({provider,id}));
             if(!sel.length)return toast('Select at least 1 model',true);
             toast('Applying pool\u2026');prog(60);
             fetch('/api/pool',{method:'POST',
               headers:{'Content-Type':'application/json'},
               body:JSON.stringify({pool:sel})}).then(r=>r.json())
-              .then(d=>{prog(100);toast('Pool saved ('+d.count+'). Router restarting ~10s. Use /model or !model to switch.');setTimeout(()=>prog(0),1500)})
+              .then(d=>{prog(100);toast('Pool saved ('+d.count+'). Router restarting ~10s. All '+d.count+' models now auto-rotate via pool-auto \u2014 no manual switching needed.');setTimeout(()=>prog(0),1500)})
               .catch(e=>{prog(0);toast('Failed: '+e,true)});
           }
           </script></body></html>"""
@@ -443,26 +462,39 @@ jobs:
           @app.route("/api/models")
           def models():
               if not authed(): return deny()
-              out = {"nvidia": [], "errors": [], "pool": load_pool(),
+              out = {"nvidia": [], "mistral": [], "errors": [], "pool": load_pool(),
                      "keys": {"NVIDIA NIM": len(KEY_NAMES),
                               "Mistral": len(MISTRAL_KEY_NAMES)}}
               if KEY_NAMES:
-                  try: out["nvidia"] = fetch_models(KEY_NAMES[0])
+                  # live catalog from NVIDIA NIM API
+                  try: out["nvidia"] = fetch_models(BASE, KEY_NAMES[0])
                   except Exception as e: out["errors"].append("nvidia: " + str(e))
               else:
                   out["errors"].append("no NVIDIA keys configured")
+              if MISTRAL_KEY_NAMES:
+                  # live catalog from Mistral API; fall back to built-in list
+                  try: out["mistral"] = fetch_models("https://api.mistral.ai/v1", MISTRAL_KEY_NAMES[0])
+                  except Exception as e:
+                      out["mistral"] = MISTRAL_MODELS
+                      out["errors"].append("mistral: " + str(e) + " (showing built-in list)")
               return jsonify(out)
 
           @app.route("/api/test", methods=["POST"])
           def test_model():
               if not authed(): return deny()
-              mid = request.get_json()["id"]
-              if not KEY_NAMES:
-                  return jsonify({"ok": False, "ms": 0, "msg": "no API keys configured"})
+              data = request.get_json()
+              mid = data["id"]
+              provider = data.get("provider", "nvidia")
+              if provider == "mistral":
+                  base, keys = "https://api.mistral.ai/v1", MISTRAL_KEY_NAMES
+              else:
+                  base, keys = BASE, KEY_NAMES
+              if not keys:
+                  return jsonify({"ok": False, "ms": 0, "msg": "no API keys for " + provider})
               body = json.dumps({"model": mid, "max_tokens": 5,
                   "messages": [{"role": "user", "content": "Say OK"}]}).encode()
-              req = urllib.request.Request(BASE + "/chat/completions", data=body,
-                  headers={"Authorization": "Bearer " + os.environ[KEY_NAMES[0]],
+              req = urllib.request.Request(base + "/chat/completions", data=body,
+                  headers={"Authorization": "Bearer " + os.environ[keys[0]],
                            "Content-Type": "application/json"})
               t0 = time.time()
               try:
@@ -482,7 +514,7 @@ jobs:
           @app.route("/api/pool", methods=["POST"])
           def set_pool():
               if not authed(): return deny()
-              pool = [x for x in request.get_json()["pool"] if x.get("provider") == "nvidia"]
+              pool = [x for x in request.get_json()["pool"] if x.get("provider") in ("nvidia", "mistral")]
               if not pool:
                   return jsonify({"ok": False, "count": 0})
               save_pool(pool)
@@ -504,7 +536,7 @@ jobs:
           home = os.environ.get("HERMES_HOME", "/home/runner/.hermes")
           p = os.path.join(home, "pool.json")
           try:
-              pool = [x for x in json.load(open(p)) if x.get("provider") == "nvidia"]
+              pool = [x for x in json.load(open(p)) if x.get("provider") in ("nvidia", "mistral")]
           except Exception:
               pool = []
           # NO hardcoded default model — pool stays empty until YOU pick one
@@ -673,10 +705,10 @@ jobs:
           hermes config set model.provider custom
           hermes config set model.base_url "http://localhost:4000/v1"
           hermes config set model.api_key "sk-local"
-          # ★ active model = first model YOU selected in the panel (never hardcoded)
-          ACTIVE_MODEL=$(python3 -c "import json; print(json.load(open('$HERMES_HOME/pool.json'))[0]['id'])")
-          echo "Active model from your pool: $ACTIVE_MODEL"
-          hermes config set model.default "$ACTIVE_MODEL"
+          # ★ default = "pool-auto": the router alias that auto-rotates across
+          #   ALL models YOU selected in the panel (never a hardcoded model)
+          hermes config set model.default "pool-auto"
+          echo "Active model: pool-auto (rotates across your whole selected pool)"
           hermes config set model.context_length 65536
           hermes config set web.search_backend searxng
           hermes config set tts.provider edge
@@ -806,13 +838,9 @@ jobs:
             if [ "$REMAIN" -le 2 ]; then
               echo "Time budget exhausted"; break
             fi
-            # re-read YOUR pool on every gateway (re)start — if you applied a
-            # new pool from the panel, its first model becomes active
-            ACTIVE_MODEL=$(python3 -c "import json; print(json.load(open('$HERMES_HOME/pool.json'))[0]['id'])" 2>/dev/null || true)
-            if [ -n "$ACTIVE_MODEL" ]; then
-              hermes config set model.default "$ACTIVE_MODEL" || true
-              echo "Active model (from your pool): $ACTIVE_MODEL"
-            fi
+            # keep "pool-auto" as default on every gateway (re)start — it
+            # always reflects the CURRENT pool you applied from the panel
+            hermes config set model.default "pool-auto" || true
             echo "Starting gateway (${REMAIN}m remaining)..."
             timeout -k 60 "${REMAIN}m" hermes gateway || true
             echo "Gateway exited, restarting in 10s..."
