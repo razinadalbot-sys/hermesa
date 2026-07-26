@@ -1,4 +1,4 @@
-name: Hermes Agent — Telegram + NVIDIA Pool
+name: Hermes Agent — Telegram + Slack + NVIDIA Pool
 
 on:
   workflow_dispatch:
@@ -255,8 +255,8 @@ jobs:
             document.getElementById('nvidia').innerHTML=items.map(m=>{
               const r=results[m],sel=pool.has(m);
               const chip=!r?'':r.loading?'<span class=chip>testing…</span>'
-                :r.ok?`<span class="chip ok">✓ ${r.ms}ms</span>`
-                :`<span class="chip bad" title="${(r.msg||'').replace(/"/g,'&quot;')}">✗ ${(r.msg||'fail').slice(0,28)}</span>`;
+                :r.ok?`<span class="chip ok">✓${r.ms}ms</span>`
+                :`<span class="chip bad" title="${(r.msg||'').replace(/"/g,'&quot;')}">✗${(r.msg||'fail').slice(0,28)}</span>`;
               return `<div class="row ${sel?'sel':''}">
                 <input type=checkbox ${sel?'checked':''} onchange="tog('${m}')">
                 <span class=name>${m}</span>${chip}
@@ -291,7 +291,7 @@ jobs:
             fetch('/api/pool',{method:'POST',
               headers:{'Content-Type':'application/json'},
               body:JSON.stringify({pool:sel})}).then(r=>r.json())
-              .then(d=>toast('✅ Pool saved ('+d.count+'). Router restarting ~10s. Run /model in Telegram to switch.'))
+              .then(d=>toast('✅ Pool saved ('+d.count+'). Router restarting ~10s. Run /model in Telegram or Slack to switch.'))
               .catch(e=>toast('Failed: '+e,true));
           }
           </script></body></html>"""
@@ -469,17 +469,23 @@ jobs:
           echo "=================================================="
           echo "::notice title=🎛️ Model Pool Panel::$PANEL_URL (password = PANEL_TOKEN secret)"
 
-      # ── 7. Write .env ──
+      # ── 7. Write .env (Telegram + Slack) ──
       - name: Write .env
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_APP_TOKEN: ${{ secrets.SLACK_APP_TOKEN }}
+          SLACK_USER_ID: ${{ secrets.SLACK_USER_ID }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: |
           mkdir -p "$HERMES_HOME"
           cat > "$HERMES_HOME/.env" <<EOF
           TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
           TELEGRAM_ALLOWED_USERS=${TELEGRAM_USER_ID}
+          SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}
+          SLACK_APP_TOKEN=${SLACK_APP_TOKEN}
+          SLACK_ALLOWED_USERS=${SLACK_USER_ID}
           SEARXNG_URL=http://localhost:8080
           CAMOUFOX_URL=ws://127.0.0.1:9222/hermes
           GROQ_API_KEY=${GROQ_API_KEY}
@@ -513,7 +519,7 @@ jobs:
           hermes config set model.provider custom
           hermes config set model.base_url "http://localhost:4000/v1"
           hermes config set model.api_key "sk-local"
-          # ★ FIX: default model = first model in YOUR saved pool (not hardcoded)
+          # ★ default model = first model in YOUR saved pool (not hardcoded)
           DEFAULT_MODEL=$(python3 -c "import json; print(json.load(open('$HERMES_HOME/pool.json'))[0]['id'])")
           echo "Default model from pool: $DEFAULT_MODEL"
           hermes config set model.default "$DEFAULT_MODEL"
@@ -564,10 +570,10 @@ jobs:
           TG_API="https://api.telegram.org"
           curl -s -X POST "${TG_API}/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_USER_ID}" \
-            -d text="🟢 Hermes Agent ONLINE (NVIDIA pool)
+            -d text="🟢 Hermes Agent ONLINE (Telegram + Slack, NVIDIA pool)
           🎛️ Model panel: ${PANEL_URL}
           🔑 Password: your PANEL_TOKEN secret
-          Use /model in Telegram to pick from the pool" > /dev/null
+          Use /model in Telegram or Slack to pick from the pool" > /dev/null
 
       # ── 12. Run gateway with time budget ──
       - name: Run Hermes gateway
