@@ -759,11 +759,15 @@ jobs:
           fi
 
           docker rm -f litellm 2>/dev/null || true
+          # --num_workers 4: each router worker caps at ~32 concurrent
+          # requests ("Worker local total request limit reached"). Agentic
+          # retry bursts can exceed one worker's cap, so run 4 workers
+          # (GitHub runners have 4 vCPUs) = ~128 concurrent requests.
           docker run -d --name litellm --network host \
             --env-file /tmp/litellm.env \
             -v /tmp/litellm.yaml:/app/config.yaml \
             ghcr.io/berriai/litellm:main-latest \
-            --config /app/config.yaml --port 4000
+            --config /app/config.yaml --port 4000 --num_workers 4
 
           rm -f /tmp/litellm.env   # keys now live only in container/process env
 
