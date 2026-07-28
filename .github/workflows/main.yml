@@ -766,7 +766,7 @@ jobs:
           docker run -d --name litellm --network host \
             --env-file /tmp/litellm.env \
             -v /tmp/litellm.yaml:/app/config.yaml \
-            ghcr.io/berriai/litellm:main-latest \
+            ghcr.io/berriai/litellm:main-stable \
             --config /app/config.yaml --port 4000 --num_workers 4
 
           rm -f /tmp/litellm.env   # keys now live only in container/process env
@@ -946,6 +946,17 @@ jobs:
           fails=0
           while true; do
             sleep 60
+            # ZOMBIE detection: LiteLLM's per-worker request counter can LEAK
+            # (climbs 39 -> 80 -> 272 and never resets). The catalog endpoint
+            # still answers, so a plain health check passes while every real
+            # completion gets 500 "Worker local total request limit reached".
+            # Restart immediately when that error shows up in recent logs.
+            if docker logs litellm --since 90s 2>&1 | grep -q "Worker local total request limit reached"; then
+              echo "$(date) Router counter leak detected — restarting litellm container"
+              docker restart litellm >/dev/null 2>&1 || true
+              fails=0
+              continue
+            fi
             if curl -fs -m 15 http://localhost:4000/v1/models >/dev/null 2>&1; then
               fails=0
             else
@@ -975,8 +986,12 @@ jobs:
             hermes config set model.default "pool-auto" || true
             echo "Starting gateway (${REMAIN}m remaining)..."
             timeout -k 60 "${REMAIN}m" hermes gateway || true
-            echo "Gateway exited, restarting in 10s..."
-            sleep 10
+            # 60s (not 10s): Telegram holds the previous gateway's getUpdates
+            # session open for up to ~1 min after a crash. Restarting too fast
+            # causes "Conflict: terminated by other getUpdates request" and a
+            # fatal polling-conflict loop.
+            echo "Gateway exited, restarting in 60s..."
+            sleep 60
           done
 
       # ── 14. Final push to data repo (main) ──
