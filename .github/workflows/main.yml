@@ -880,6 +880,12 @@ jobs:
           hermes config set model.default "pool-auto"
           echo "Active model: pool-auto (rotates across your whole selected pool)"
           hermes config set model.context_length 65536
+          # Survive router restarts: the LiteLLM counter-leak forces a fast
+          # container restart (~10-20s blip). Default api_max_retries=3 gives
+          # the gateway only ~7s of retry budget, so turns were DYING inside
+          # the blip. 8 retries with exponential backoff spans well past any
+          # restart window — the turn just waits and continues.
+          hermes config set agent.api_max_retries 8
           hermes config set web.search_backend searxng
           hermes config set tts.provider edge
           hermes config set toolsets '["terminal","files","web","browser","code","vision","tts","memory","skills","delegation","cron"]'
@@ -987,33 +993,19 @@ jobs:
           fi
           export DISPLAY=:99
 
-          # AUTO-FRESH SESSION each run (kills the manual /new pain):
-          # sessions.json is only the gateway ROUTING INDEX — it maps each
-          # Telegram/Slack chat to its active session ID. Deleting it detaches
-          # chats from the old bloated session, so the first message of this
-          # run starts a FRESH one. Nothing is lost: full history stays in
-          # state.db (searchable + /resume-able), and MEMORY/USER/skills
-          # persist separately. With 24/7 chaining this means an automatic
-          # clean slate every ~5.5h.
-          rm -f "$HERMES_HOME/sessions/sessions.json"
-
           # watchdog: if the LiteLLM router hangs (rate-limit deadlock etc.),
           # auto-restart it — no more force-stopping the whole Action run
           cat > /tmp/watchdog.sh <<'EOF'
           #!/bin/bash
           fails=0
-          tick=0
           while true; do
-            # 15s sweeps: the leak error must be caught FAST — turns die while
-            # the router is rejecting requests, so detection lag = user pain.
-            sleep 15
-            tick=$((tick+1))
+            sleep 60
             # ZOMBIE detection: LiteLLM's per-worker request counter can LEAK
             # (climbs 39 -> 80 -> 272 and never resets). The catalog endpoint
             # still answers, so a plain health check passes while every real
             # completion gets 500 "Worker local total request limit reached".
             # Restart immediately when that error shows up in recent logs.
-            if docker logs litellm --since 30s 2>&1 | grep -q "Worker local total request limit reached"; then
+            if docker logs litellm --since 90s 2>&1 | grep -q "Worker local total request limit reached"; then
               echo "$(date) Router counter leak detected — restarting litellm container"
               # -t 2: kill fast. Default docker restart waits 10s for graceful
               # stop; that downtime is what burns the gateway's quick retries.
@@ -1021,8 +1013,6 @@ jobs:
               fails=0
               continue
             fi
-            # plain health check stays on a 60s cadence (every 4th tick)
-            [ $((tick % 4)) -ne 0 ] && continue
             if curl -fs -m 15 http://localhost:4000/v1/models >/dev/null 2>&1; then
               fails=0
             else
