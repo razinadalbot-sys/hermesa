@@ -34,6 +34,22 @@ jobs:
           git clone --depth 1 "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git" /tmp/data || true
           if [ -d /tmp/data ]; then
             rm -f /tmp/data/.env
+            # RESTORE FROM BACKUP BRANCH TOO: the 30-min backup loop pushes to
+            # the 'backup' branch, while the final push (end of run) goes to
+            # 'main'. If the previous run crashed / was cancelled / hit the
+            # timeout, the final push never ran — the freshest memory + work
+            # files exist ONLY on 'backup'. Compare timestamps and overlay
+            # whichever is newer, so the bot's brain survives dirty shutdowns.
+            main_ts=$(cd /tmp/data && git log -1 --format=%ct 2>/dev/null || echo 0)
+            git clone --depth 1 -b backup "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git" /tmp/databk 2>/dev/null || true
+            if [ -d /tmp/databk ]; then
+              bk_ts=$(cd /tmp/databk && git log -1 --format=%ct 2>/dev/null || echo 0)
+              if [ "$bk_ts" -gt "$main_ts" ]; then
+                echo "backup branch is newer than main — restoring latest data from backup"
+                rm -f /tmp/databk/.env
+                rsync -a --exclude='.git' /tmp/databk/ /tmp/data/
+              fi
+            fi
             rsync -a --exclude='.git' /tmp/data/ "$HERMES_HOME/" || true
             find "$HERMES_HOME" -name "*.gh-chunk.000" | while read -r first; do
               base="${first%.gh-chunk.000}"
@@ -853,6 +869,17 @@ jobs:
           mkdir -p "$HERMES_HOME/work"
           cat > "$HOME/AGENTS.md" <<'EOF'
           # Standing instructions
+          - CRITICAL: THIS MACHINE IS WIPED after every run (fresh VM each
+            time). ONLY files under ~/.hermes/ survive via automatic backup.
+            Create ALL projects, scripts, credential/account files, downloads,
+            and outputs under ~/.hermes/work/ — NEVER in ~, /tmp, or any other
+            path. If you just created files elsewhere, move them into
+            ~/.hermes/work/ immediately. Anything outside ~/.hermes/ WILL BE
+            LOST when the run ends.
+          - When the user sends/uploads a file in chat, IMMEDIATELY copy it
+            into ~/.hermes/work/ and do all reading/editing on THAT copy.
+            Platform uploads land in a temporary cache that gets auto-deleted;
+            the ~/.hermes/work/ copy is the only one that survives.
           - For any long or multi-step task (scraping, research, data
             collection, comparisons), IMMEDIATELY append each intermediate
             result to a file under ~/.hermes/work/ as you go. Never keep
@@ -887,6 +914,10 @@ jobs:
           # restart window — the turn just waits and continues.
           hermes config set agent.api_max_retries 8
           hermes config set web.search_backend searxng
+          # Edge TTS needs the edge-tts package on the machine — an earlier
+          # run failed with "edge-tts: command not found". Free Microsoft
+          # voices (400+ incl. Bangla bn-BD), no API key needed.
+          pip install -q edge-tts || true
           hermes config set tts.provider edge
           hermes config set toolsets '["terminal","files","web","browser","code","vision","tts","memory","skills","delegation","cron"]'
           hermes doctor || true
@@ -992,6 +1023,39 @@ jobs:
             sleep 2
           fi
           export DISPLAY=:99
+
+          # SMART SESSION RESET: keep the conversation ALIVE across runs.
+          # sessions.json is the gateway routing index (chat -> active session
+          # id). We check each active session's real context size in state.db
+          # and detach ONLY if it is genuinely bloated (>45k tokens). Otherwise
+          # the bot continues the SAME conversation after a re-run — no
+          # amnesia, no manual /new. If anything fails, we keep continuity.
+          python3 - <<'PYSESS'
+          import os, re, sqlite3
+          home = os.environ.get("HERMES_HOME", "/home/runner/.hermes")
+          idx = os.path.join(home, "sessions", "sessions.json")
+          db = os.path.join(home, "state.db")
+          try:
+              if os.path.exists(idx) and os.path.exists(db):
+                  raw = open(idx, encoding="utf-8").read()
+                  ids = set(re.findall(r"\d{8}_\d{6}_[0-9a-f]+", raw))
+                  worst = 0
+                  if ids:
+                      conn = sqlite3.connect(db)
+                      for sid in ids:
+                          row = conn.execute(
+                              "SELECT COALESCE(SUM(token_count),0) FROM messages WHERE session_id=?",
+                              (sid,)).fetchone()
+                          worst = max(worst, row[0] or 0)
+                      conn.close()
+                  if worst > 45000:
+                      os.remove(idx)
+                      print("session context ~%d tokens -> bloated, starting fresh this run" % worst)
+                  else:
+                      print("session context ~%d tokens -> continuing previous conversation" % worst)
+          except Exception as e:
+              print("session check skipped (keeping continuity):", e)
+          PYSESS
 
           # watchdog: if the LiteLLM router hangs (rate-limit deadlock etc.),
           # auto-restart it — no more force-stopping the whole Action run
