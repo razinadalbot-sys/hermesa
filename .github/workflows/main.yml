@@ -3,6 +3,12 @@ name: Hermes Agent — Telegram + Slack + NVIDIA/Mistral Pool
 on:
   workflow_dispatch:
 
+# actions:write lets the last step dispatch the NEXT run (24/7 chaining)
+# using the built-in GITHUB_TOKEN - no extra secret needed.
+permissions:
+  contents: read
+  actions: write
+
 concurrency:
   group: hermes-agent
   cancel-in-progress: false
@@ -103,7 +109,20 @@ jobs:
           pip install -q flask
           mkdir -p /tmp/panel
           cat > /tmp/panel/app.py <<'PYEOF'
-          import os, json, subprocess, sys, time, hmac, secrets, urllib.request, urllib.error
+          import os, json, subprocess, sys, time, hmac, secrets, urllib.request, urllib.error, urllib.parse
+
+          def tg_notify(text):
+              # best-effort Telegram alert; never crash the panel over it
+              try:
+                  tk = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+                  uid = os.environ.get("TELEGRAM_USER_ID", "")
+                  if tk and uid:
+                      urllib.request.urlopen(
+                          "https://api.telegram.org/bot" + tk + "/sendMessage",
+                          data=urllib.parse.urlencode({"chat_id": uid, "text": text}).encode(),
+                          timeout=10)
+              except Exception:
+                  pass
           from flask import Flask, request, jsonify, make_response
 
           app = Flask(__name__)
@@ -215,6 +234,7 @@ jobs:
                           subprocess.Popen(["docker", "restart", "-t", "2", "litellm"],
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                           print("auto-pruned dead/EOL models: " + ", ".join(removed), flush=True)
+                          tg_notify("🪦 Hermes: auto-pruned dead model(s) mid-run: " + ", ".join(removed) + ". Pool keeps running with the rest.")
                   except Exception as e:
                       print("auto-prune error: " + str(e), flush=True)
 
@@ -685,6 +705,11 @@ jobs:
             sleep 1
           done < <(printf '%s\n' "$NVIDIA_KEYS" | tr ',' '\n')
           echo "NVIDIA keys: $n valid, $bad_n dropped"
+          if [ "$bad_n" -gt 0 ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_USER_ID}" \
+              -d text="🚨 Hermes: ${bad_n} NVIDIA key(s) dead (auth failed) - ${n} still working" > /dev/null || true
+          fi
           if [ "$n" -eq 0 ]; then
             echo "::error::No working NVIDIA key — secret is empty or every key failed the auth check"
             exit 1
@@ -707,6 +732,11 @@ jobs:
             sleep 1
           done < <(printf '%s\n' "$MISTRAL_KEYS" | tr ',' '\n')
           echo "Mistral keys: $m valid, $bad_m dropped"
+          if [ "$bad_m" -gt 0 ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_USER_ID}" \
+              -d text="🚨 Hermes: ${bad_m} Mistral key(s) dead (auth failed) - ${m} still working" > /dev/null || true
+          fi
 
           # make the split keys visible to this shell + panel process
           set -a; source /tmp/litellm.env; set +a
@@ -947,19 +977,43 @@ jobs:
       # ── 13. Run gateway with time budget + anti-stuck watchdog ──
       - name: Run Hermes gateway
         run: |
+          # Shared virtual display :99 for the AGENT's GUI work (screenshots,
+          # Qt apps, image tools). The browser's own virtual display is private
+          # to it — without this, scrot/GUI apps fail with "Can't open X
+          # display". Every terminal the agent opens inherits DISPLAY=:99.
+          if ! pgrep -f "Xvfb :99" >/dev/null; then
+            Xvfb :99 -screen 0 1920x1080x24 > /tmp/xvfb99.log 2>&1 &
+            sleep 2
+          fi
+          export DISPLAY=:99
+
+          # AUTO-FRESH SESSION each run (kills the manual /new pain):
+          # sessions.json is only the gateway ROUTING INDEX — it maps each
+          # Telegram/Slack chat to its active session ID. Deleting it detaches
+          # chats from the old bloated session, so the first message of this
+          # run starts a FRESH one. Nothing is lost: full history stays in
+          # state.db (searchable + /resume-able), and MEMORY/USER/skills
+          # persist separately. With 24/7 chaining this means an automatic
+          # clean slate every ~5.5h.
+          rm -f "$HERMES_HOME/sessions/sessions.json"
+
           # watchdog: if the LiteLLM router hangs (rate-limit deadlock etc.),
           # auto-restart it — no more force-stopping the whole Action run
           cat > /tmp/watchdog.sh <<'EOF'
           #!/bin/bash
           fails=0
+          tick=0
           while true; do
-            sleep 60
+            # 15s sweeps: the leak error must be caught FAST — turns die while
+            # the router is rejecting requests, so detection lag = user pain.
+            sleep 15
+            tick=$((tick+1))
             # ZOMBIE detection: LiteLLM's per-worker request counter can LEAK
             # (climbs 39 -> 80 -> 272 and never resets). The catalog endpoint
             # still answers, so a plain health check passes while every real
             # completion gets 500 "Worker local total request limit reached".
             # Restart immediately when that error shows up in recent logs.
-            if docker logs litellm --since 90s 2>&1 | grep -q "Worker local total request limit reached"; then
+            if docker logs litellm --since 30s 2>&1 | grep -q "Worker local total request limit reached"; then
               echo "$(date) Router counter leak detected — restarting litellm container"
               # -t 2: kill fast. Default docker restart waits 10s for graceful
               # stop; that downtime is what burns the gateway's quick retries.
@@ -967,6 +1021,8 @@ jobs:
               fails=0
               continue
             fi
+            # plain health check stays on a 60s cadence (every 4th tick)
+            [ $((tick % 4)) -ne 0 ] && continue
             if curl -fs -m 15 http://localhost:4000/v1/models >/dev/null 2>&1; then
               fails=0
             else
@@ -1029,7 +1085,28 @@ jobs:
           git add -A && git commit -q -m "final save $(date -u +%FT%TZ)" || true
           git push -f "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git" main
 
-      # ── 15. Notify failure ──
+      # ── 15. Start next run (24/7 chaining) ──
+      # Dispatches a fresh run of THIS workflow when the current one ends.
+      # The concurrency group makes the new run QUEUE until this one exits,
+      # so two gateways never overlap (no Telegram polling conflict).
+      # Cancelling a run manually BREAKS the chain (if: !cancelled()) -
+      # cancel = stop for good, let it finish = runs 24/7.
+      - name: Start next run (24/7 chain)
+        if: ${{ !cancelled() }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          WF_FILE="${GITHUB_WORKFLOW_REF#*/.github/workflows/}"
+          WF_FILE="${WF_FILE%%@*}"
+          echo "Chaining next run of ${WF_FILE} on ${GITHUB_REF_NAME}..."
+          curl -s -X POST \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/${WF_FILE}/dispatches" \
+            -d "{\"ref\":\"${GITHUB_REF_NAME}\"}" \
+            && echo "Next run queued OK" || echo "::warning::Could not queue next run"
+
+      # ── 16. Notify failure ──
       - name: Notify failure
         if: failure()
         env:
