@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  RUN_MINUTES: 330
+  RUN_MINUTES: 350
   HERMES_HOME: /home/runner/.hermes
   DATA_REPO: jahid12525/harmesprivatestorage
 
