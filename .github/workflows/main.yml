@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  RUN_MINUTES: 350
+  RUN_MINUTES: 330
   HERMES_HOME: /home/runner/.hermes
   DATA_REPO: jahid12525/harmesprivatestorage
 
@@ -83,10 +83,35 @@ jobs:
         run: |
           # Shared virtual display :99 — the browser AND all the agent's GUI
           # work render here, so the LIVE VIEW (below) shows everything.
-          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb x11vnc novnc websockify
+          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb x11vnc novnc websockify fluxbox xterm
           Xvfb :99 -screen 0 1920x1080x24 > /tmp/xvfb99.log 2>&1 &
           sleep 2
           export DISPLAY=:99
+
+          # A bare Xvfb display renders PURE BLACK when idle — looks broken in
+          # the live view. Fluxbox = real desktop (background, taskbar, window
+          # titlebars), and the status xterm keeps something moving on screen
+          # at all times so you can SEE the machine is alive.
+          fluxbox > /tmp/fluxbox.log 2>&1 &
+          sleep 1
+          cat > /tmp/status.sh <<'EOF'
+          #!/bin/bash
+          while true; do
+            clear
+            echo "============================================"
+            echo "  HERMES AGENT — LIVE DESKTOP  (display :99)"
+            echo "============================================"
+            date
+            echo
+            echo "Running services:"
+            pgrep -a -f 'hermes|camoufox|litellm|searxng|cloudflared' | cut -c1-105
+            echo
+            echo "Browser windows appear here when the agent works..."
+            sleep 2
+          done
+          EOF
+          chmod +x /tmp/status.sh
+          xterm -geometry 130x20+30+30 -fg green -bg black -T "Hermes Agent — status" -e /tmp/status.sh &
           pip install -U "camoufox[geoip]" pyvirtualdisplay
           python3 -m camoufox fetch
           mkdir -p "$HERMES_HOME/browser-profile"
