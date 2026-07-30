@@ -1157,9 +1157,9 @@ jobs:
         run: |
           mkdir -p /tmp/jarvis
           cat > /tmp/jarvis/app.py <<'PYJARVIS'
-          import os, re, subprocess, threading, uuid, mimetypes, shutil
+          import os, re, subprocess, threading, uuid, mimetypes, shutil, hmac, secrets
           import requests as rq
-          from flask import Flask, request, jsonify, Response
+          from flask import Flask, request, jsonify, Response, make_response, redirect
 
           TOKEN = os.environ.get("PANEL_TOKEN", "hermes99")
           GROQ = os.environ.get("GROQ_API_KEY", "").strip()
@@ -1170,6 +1170,51 @@ jobs:
           UP_DIR = os.path.join(WORK_DIR, "uploads")
           JOBS = {}
           ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+          SESSION = secrets.token_hex(32)
+
+          def authed():
+              c = request.cookies.get("j") or ""
+              if c and hmac.compare_digest(c, SESSION):
+                  return True
+              h = request.headers.get("X-Token", "")
+              if h and hmac.compare_digest(h, TOKEN):
+                  return True
+              q = request.args.get("token", "")
+              return bool(q) and hmac.compare_digest(q, TOKEN)
+
+          def sec_cookie():
+              return request.headers.get("X-Forwarded-Proto", "") == "https"
+
+          def set_session(resp):
+              resp.set_cookie("j", SESSION, httponly=True, secure=sec_cookie(),
+                              samesite="Lax", max_age=12 * 3600)
+              return resp
+
+          LOGIN = """<!doctype html><html><head><meta charset="utf-8">
+          <title>AGENT ACCESS</title>
+          <meta name="viewport" content="width=device-width,initial-scale=1">
+          <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;800&family=Rajdhani:wght@400;600&display=swap" rel="stylesheet">
+          <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css">
+          <style>
+          body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#010409;color:#bdeeff;font-family:Rajdhani,sans-serif}
+          .box{border:1px solid #1d6f9b;border-radius:14px;padding:34px 30px;text-align:center;box-shadow:0 0 34px #00aaff44;background:#04121fcc}
+          .big{font-size:34px;color:#6fe0ff}
+          h2{font-family:Orbitron;letter-spacing:5px;color:#6fe0ff;margin:14px 0 4px}
+          .sub{font-size:12px;letter-spacing:.2em;color:#3f7f99;margin-bottom:18px}
+          input{background:#04121f;border:1px solid #12557a;color:#bdeeff;padding:12px;border-radius:9px;width:250px;font-size:15px}
+          button{margin-top:12px;background:#062c44;color:#7ee6ff;border:1px solid #1d6f9b;border-radius:10px;padding:11px 22px;cursor:pointer;font-family:Orbitron;letter-spacing:2px;width:278px}
+          button:hover{box-shadow:0 0 14px #00aaff}
+          .err{color:#ff8fa3;font-size:13px;min-height:18px;margin-top:10px}
+          </style></head><body>
+          <form class=box method="post" action="/login">
+            <i class="fa-solid fa-user-shield big"></i>
+            <h2>AGENT</h2>
+            <div class=sub>ACCESS TOKEN REQUIRED</div>
+            <input type="password" name="password" placeholder="PANEL_TOKEN" autofocus>
+            <br><button type="submit"><i class="fa-solid fa-unlock"></i> ENGAGE</button>
+            <div class=err>__ERR__</div>
+          </form>
+          </body></html>"""
 
           def cur_voice():
               try:
@@ -1275,6 +1320,8 @@ jobs:
           select{background:#04121f;color:#7ee6ff;border:1px solid #12557a;border-radius:10px;padding:9px;font-size:14px}
           label{font-size:12px;letter-spacing:.1em;color:#5fb6d8;display:flex;gap:5px;align-items:center;cursor:pointer}
           #toast{position:fixed;top:12px;left:50%;transform:translateX(-50%);background:#3a0d14;border:1px solid #ff5470;color:#ffb3c0;padding:10px 16px;border-radius:10px;z-index:20;display:none;max-width:92vw;font-size:14px}
+          #lout{position:fixed;right:12px;bottom:10px;color:#3f7f99;font-size:15px;text-decoration:none;z-index:20}
+          #lout:hover{color:#7ee6ff}
           #gate{position:fixed;inset:0;background:#010409ee;display:flex;align-items:center;justify-content:center;z-index:9}
           #gatebox{border:1px solid #1d6f9b;border-radius:12px;padding:28px;text-align:center;box-shadow:0 0 30px #00aaff44}
           #gatebox h2{font-family:Orbitron;letter-spacing:4px;margin-bottom:12px;color:#6fe0ff}
@@ -1305,31 +1352,16 @@ jobs:
             <input type="file" id="fpick" multiple style="display:none">
            </div>
           </div>
-          <div id="gate"><div id="gatebox"><h2>ACCESS TOKEN</h2><input id="tok" type="password" placeholder="PANEL_TOKEN"><br><div id="gerr" style="color:#ff8fa3;font-size:12px;min-height:17px;margin-bottom:6px"></div><button id="tokb" type="button"><i class="fa-solid fa-unlock"></i> ENGAGE</button></div></div>
+          <a href="/logout" id="lout" title="Log out"><i class="fa-solid fa-right-from-bracket"></i></a>
           <script>
           function el(id){return document.getElementById(id);}
-          window.onerror=function(m){try{var g=document.getElementById('gerr');if(g){g.textContent='Script error: '+m;}}catch(e){}};
-          function lsGet(k){try{return localStorage.getItem(k)||'';}catch(e){return '';}}
-          function lsSet(k,v){try{localStorage.setItem(k,v);}catch(e){}}
-          var tok=lsGet('jtok');
+          window.onerror=function(m){try{var t=document.getElementById('toast');if(t){t.textContent='Script error: '+m;t.style.display='block';}}catch(e){}};
+          var tok='';
           var elTTS=false,srvSTT=false,SRbroken=false,busy=false;
           var SR=window.SpeechRecognition||window.webkitSpeechRecognition;
           var rec=null,mrec=null,stream=null,listening=false,curA=null,curU=null,vadT=null,actx=null,t0=0,recSpoke=false;
-          function boot(){fetch('/config',{headers:{'X-Token':tok}}).then(function(r){if(r.status===401){lsSet('jtok','');tok='';el('gate').style.display='flex';el('gerr').textContent='Saved token was rejected — enter your PANEL_TOKEN again.';return null;}return r.json();}).then(function(j){if(!j){return;}elTTS=!!j.tts;srvSTT=!!j.stt;el('engine').textContent='VOICE: '+(elTTS?'EDGE NEURAL':'BROWSER')+' · EARS: '+(srvSTT?'SERVER + BROWSER':'BROWSER ONLY');}).catch(function(){});}
-          if(tok){el('gate').style.display='none';boot();}
-          function gateTry(){
-            var v=el('tok').value.trim();
-            if(!v){el('gerr').textContent='Enter your PANEL_TOKEN secret.';return;}
-            el('gerr').textContent='Verifying...';el('tokb').disabled=true;
-            fetch('/config',{headers:{'X-Token':v}}).then(function(r){
-              el('tokb').disabled=false;
-              if(r.status===401){el('gerr').textContent='Wrong token — use the full PANEL_TOKEN secret (no spaces).';return;}
-              if(!r.ok){el('gerr').textContent='Server error '+r.status+' — try again.';return;}
-              tok=v;lsSet('jtok',tok);el('gerr').textContent='';el('gate').style.display='none';boot();
-            }).catch(function(){el('tokb').disabled=false;el('gerr').textContent='Cannot reach the Agent server — open the newest HUD link from Telegram.';});
-          }
-          el('tokb').addEventListener('click',gateTry);
-          el('tok').addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();gateTry();}});
+          function boot(){fetch('/config',{credentials:'same-origin'}).then(function(r){if(r.status===401){location.href='/logout';return null;}return r.json();}).then(function(j){if(!j){return;}elTTS=!!j.tts;srvSTT=!!j.stt;el('engine').textContent='VOICE: '+(elTTS?'EDGE NEURAL':'BROWSER')+' · EARS: '+(srvSTT?'SERVER + BROWSER':'BROWSER ONLY');}).catch(function(){});}
+          boot();
           function toast(m){var t=el('toast');t.textContent=m;t.style.display='block';clearTimeout(t.h);t.h=setTimeout(function(){t.style.display='none';},6000);}
           function setState(s,l){document.body.className=s;el('state').textContent=l;}
           function addMsg(who,text){var d=document.createElement('div');d.className='msg '+who;var b=document.createElement('b');b.textContent=who;var p=document.createElement('pre');p.textContent=text;d.appendChild(b);d.appendChild(p);el('log').appendChild(d);el('log').scrollTop=el('log').scrollHeight;}
@@ -1475,17 +1507,33 @@ jobs:
 
           @app.route("/")
           def home():
-              return Response(HTML, mimetype="text/html")
+              if not authed():
+                  return Response(LOGIN.replace("__ERR__", ""), mimetype="text/html")
+              return set_session(make_response(Response(HTML, mimetype="text/html")))
+
+          @app.route("/login", methods=["POST"])
+          def login():
+              pw = (request.form.get("password") or "").strip()
+              if pw and hmac.compare_digest(pw, TOKEN):
+                  return set_session(make_response(redirect("/")))
+              msg = "Wrong token - paste the full PANEL_TOKEN secret, no spaces."
+              return Response(LOGIN.replace("__ERR__", msg), mimetype="text/html"), 401
+
+          @app.route("/logout")
+          def logout():
+              r = make_response(redirect("/"))
+              r.set_cookie("j", "", max_age=0)
+              return r
 
           @app.route("/config")
           def config():
-              if request.headers.get("X-Token", "") != TOKEN:
+              if not authed():
                   return jsonify(error="bad token"), 401
               return jsonify(tts=bool(shutil.which("edge-tts")), stt=bool(GROQ), voice=cur_voice())
 
           @app.route("/tts", methods=["POST"])
           def tts_route():
-              if request.headers.get("X-Token", "") != TOKEN:
+              if not authed():
                   return jsonify(error="bad token"), 401
               j = request.get_json(silent=True) or {}
               text = (j.get("text") or "").strip()
@@ -1498,7 +1546,7 @@ jobs:
 
           @app.route("/stt", methods=["POST"])
           def stt_route():
-              if request.headers.get("X-Token", "") != TOKEN:
+              if not authed():
                   return jsonify(error="bad token"), 401
               blob = request.get_data()
               if not blob or len(blob) < 1000:
@@ -1511,7 +1559,7 @@ jobs:
 
           @app.route("/upload", methods=["POST"])
           def upload():
-              if request.headers.get("X-Token", "") != TOKEN:
+              if not authed():
                   return jsonify({"error": "bad token"}), 403
               name = request.headers.get("X-Filename", "file.bin")
               name = re.sub(r"[^A-Za-z0-9._-]", "_", name)[-80:] or "file.bin"
@@ -1526,7 +1574,7 @@ jobs:
 
           @app.route("/file")
           def getfile():
-              if request.args.get("token", "") != TOKEN and request.headers.get("X-Token", "") != TOKEN:
+              if not authed():
                   return jsonify({"error": "bad token"}), 403
               p = os.path.realpath(request.args.get("p", ""))
               if not p.startswith(os.path.realpath(WORK_DIR)) or not os.path.isfile(p):
@@ -1538,7 +1586,7 @@ jobs:
 
           @app.route("/ask", methods=["POST"])
           def ask():
-              if request.headers.get("X-Token", "") != TOKEN:
+              if not authed():
                   return jsonify(error="bad token"), 401
               text = ((request.get_json(silent=True) or {}).get("text") or "").strip()
               if not text:
@@ -1550,7 +1598,7 @@ jobs:
 
           @app.route("/poll")
           def poll():
-              if request.headers.get("X-Token", "") != TOKEN:
+              if not authed():
                   return jsonify(error="bad token"), 401
               j = JOBS.get(request.args.get("id", ""))
               if not j:
