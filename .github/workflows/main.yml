@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  RUN_MINUTES: 350
+  RUN_MINUTES: 330
   HERMES_HOME: /home/runner/.hermes
   DATA_REPO: jahid12525/harmesprivatestorage
 
@@ -57,11 +57,33 @@ jobs:
             done
           fi
 
-      # ── 2. Install Hermes Agent ──
+      # ── 1b. Preinstalled environment cache ──
+      # The runner VM is WIPED after every run, so nothing can be truly
+      # "pre-installed". This cache is the next best thing: a snapshot of
+      # installed Hermes + all pip wheels + the Camoufox browser binary,
+      # restored in seconds at the start of each run instead of being
+      # re-downloaded. The first run builds it; every later run refreshes
+      # it automatically (rolling key).
+      - name: Restore preinstalled Hermes environment (cache)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.local
+            ~/.cache/pip
+            ~/.cache/camoufox
+          key: hermes-env-v1-${{ github.run_id }}
+          restore-keys: |
+            hermes-env-v1-
+
+      # ── 2. Install Hermes Agent (skipped when restored from cache) ──
       - name: Install Hermes Agent
         run: |
           rm -rf "$HERMES_HOME/hermes-agent"
-          curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+          if [ -x "$HOME/.local/bin/hermes" ]; then
+            echo "Hermes restored from cache — skipping download/install"
+          else
+            curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+          fi
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       # ── 3. Start SearXNG (free web search) ──
@@ -146,6 +168,7 @@ jobs:
             echo "::warning::No Chromium-family browser found — built-in browser tools will be headless"
           fi
           pip install -U "camoufox[geoip]" pyvirtualdisplay
+          # fetch skips the ~200MB browser download when restored from cache
           python3 -m camoufox fetch
           mkdir -p "$HERMES_HOME/browser-profile"
           nohup python3 -c "
@@ -180,10 +203,10 @@ jobs:
       # ── 5. Write model pool control panel ──
       - name: Write control panel
         run: |
-          pip install -q flask
+          pip install -q flask edge-tts
           mkdir -p /tmp/panel
           cat > /tmp/panel/app.py <<'PYEOF'
-          import os, json, subprocess, sys, time, hmac, secrets, urllib.request, urllib.error, urllib.parse
+          import os, re, json, subprocess, sys, time, hmac, secrets, urllib.request, urllib.error, urllib.parse
 
           def tg_notify(text):
               # best-effort Telegram alert; never crash the panel over it
@@ -371,6 +394,7 @@ jobs:
               open(CFG, "w").write("\n".join(L) + "\n")
 
           LOGIN = """<!doctype html><html><head><meta charset=utf-8>
+          <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css">
           <meta name=viewport content="width=device-width,initial-scale=1">
           <title>Hermes Panel</title>
           <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
@@ -401,13 +425,13 @@ jobs:
           </style></head><body>
           <div class="orb o1"></div><div class="orb o2"></div>
           <div class=box id=box>
-            <div class=logo>&#9884;</div>
+            <div class=logo><i class="fa-solid fa-atom"></i></div>
             <h1>Hermes Command Deck</h1>
             <div class=tag>Model pool &amp; router control</div>
             <form onsubmit="go(event)">
               <div class=field>
                 <input type=password id=pw placeholder="Panel password" autofocus autocomplete=off>
-                <span class=eye onclick="tgl()" id=eye>&#128065;</span>
+                <span class=eye onclick="tgl()" id=eye><i class="fa-solid fa-eye"></i></span>
               </div>
               <button id=btn>Unlock console</button>
             </form>
@@ -429,6 +453,7 @@ jobs:
           </script></body></html>"""
 
           HTML = """<!doctype html><html><head><meta charset=utf-8>
+          <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css">
           <meta name=viewport content="width=device-width,initial-scale=1">
           <title>Hermes Command Deck</title>
           <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
@@ -502,7 +527,7 @@ jobs:
           </style></head><body>
           <div class="orb o1"></div><div class="orb o2"></div>
           <nav>
-            <div class=logo>&#9884;</div>
+            <div class=logo><i class="fa-solid fa-atom"></i></div>
             <div><h1>Hermes Command Deck</h1><div class=crumb>model pool &middot; litellm router</div></div>
             <div class=pill><span class=dot></span><span id=sub>Loading catalog...</span></div>
           </nav>
@@ -512,10 +537,10 @@ jobs:
             </div>
             <div class=card style="margin-bottom:18px">
               <div class=chead>
-                <h2>&#128225; NVIDIA NIM Catalog</h2><span class=badge id=cntN>&ndash;</span>
+                <h2><i class="fa-solid fa-microchip"></i> NVIDIA NIM Catalog</h2><span class=badge id=cntN>&ndash;</span>
                 <button class=chip id=selchip onclick="selOnlyTgl()">Selected only</button>
               </div>
-              <div class=sbox><span class=ico>&#128269;</span>
+              <div class=sbox><span class=ico><i class="fa-solid fa-magnifying-glass"></i></span>
                 <input class=search placeholder="Filter models... try 'instruct' or 'llama'" oninput="filt(this.value)"></div>
               <div class=list id=nvidia>
                 <div class=skel></div><div class=skel></div><div class=skel></div><div class=skel></div><div class=skel></div>
@@ -523,10 +548,21 @@ jobs:
             </div>
             <div class=card>
               <div class=chead>
-                <h2>&#127756; Mistral Catalog</h2><span class=badge id=cntM>&ndash;</span>
+                <h2><i class="fa-solid fa-wind"></i> Mistral Catalog</h2><span class=badge id=cntM>&ndash;</span>
               </div>
               <div class=list id=mistral style="max-height:34vh">
                 <div class=skel></div><div class=skel></div>
+              </div>
+            </div>
+            <div class=card style="margin-top:18px">
+              <div class=chead>
+                <h2><i class="fa-solid fa-volume-high"></i> Agent Voice (Edge Neural)</h2><span class=badge id=vcur>&ndash;</span>
+              </div>
+              <div class=sbox><span class=ico><i class="fa-solid fa-magnifying-glass"></i></span>
+                <input class=search placeholder="Filter voices... try 'en-US' or 'bn'" oninput="vfilt(this.value)"></div>
+              <div style="display:flex;gap:10px;align-items:center;margin-top:10px">
+                <select id=vsel style="flex:1;min-width:0;background:#0b1220;color:#dbe7ff;border:1px solid #2a3b5f;border-radius:10px;padding:10px"></select>
+                <button class="btn ghost" onclick="applyVoice()"><i class="fa-solid fa-check"></i> Apply</button>
               </div>
             </div>
           </div>
@@ -534,7 +570,7 @@ jobs:
             <div class=prog id=prog></div>
             <div class=fin>
               <div class=info id=info><b>0</b> models selected</div>
-              <button class="btn ghost" onclick="testSelected()">&#9889; Test selected</button>
+              <button class="btn ghost" onclick="testSelected()"><i class="fa-solid fa-bolt"></i> Test selected</button>
               <button class="btn primary" onclick="applyPool()">Apply pool &rarr;</button>
             </div>
           </footer>
@@ -626,6 +662,12 @@ jobs:
               .then(d=>{prog(100);toast('Pool saved ('+d.count+'). Router restarting ~10s. All '+d.count+' models now auto-rotate via pool-auto \u2014 no manual switching needed.');setTimeout(()=>prog(0),1500)})
               .catch(e=>{prog(0);toast('Failed: '+e,true)});
           }
+          var VOICES=[];
+          function vfill(list){var s=document.getElementById('vsel');s.innerHTML='';list.forEach(function(v){var o=document.createElement('option');o.value=v;o.textContent=v;s.appendChild(o);});}
+          function vfilt(q){q=q.toLowerCase();vfill(VOICES.filter(function(v){return v.toLowerCase().indexOf(q)>=0;}));}
+          function loadVoices(){fetch('/api/voices').then(r=>r.json()).then(d=>{VOICES=d.voices||[];vfill(VOICES);var c=d.current||'';document.getElementById('vcur').textContent=c||'default';if(c){document.getElementById('vsel').value=c;}}).catch(()=>{});}
+          function applyVoice(){var v=document.getElementById('vsel').value;if(!v)return toast('Pick a voice first',true);toast('Applying voice\u2026');fetch('/api/voice',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({voice:v})}).then(r=>r.json()).then(d=>{if(d.ok){document.getElementById('vcur').textContent=v;toast('Agent voice set to '+v+' \u2014 applies to the next spoken reply');}else{toast(d.msg||'Failed',true);}}).catch(e=>toast('Failed: '+e,true));}
+          loadVoices();
           </script></body></html>"""
 
           @app.route("/")
@@ -715,6 +757,52 @@ jobs:
               subprocess.Popen(["docker", "restart", "-t", "2", "litellm"],
                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
               return jsonify({"ok": True, "count": len(pool)})
+
+          VOICE_FILE = os.path.join(os.path.expanduser("~/.hermes"), "voice.txt")
+          VOICES_CACHE = []
+
+          def edge_voice_list():
+              global VOICES_CACHE
+              if VOICES_CACHE:
+                  return VOICES_CACHE
+              try:
+                  p = subprocess.run(["edge-tts", "--list-voices"],
+                                     capture_output=True, text=True, timeout=60)
+                  vs = []
+                  for ln in p.stdout.splitlines():
+                      tok = ln.split()
+                      if tok and re.match(r"^[a-z]{2,3}-[A-Za-z]{2,4}.*Neural$", tok[0]):
+                          vs.append(tok[0])
+                  VOICES_CACHE = sorted(set(vs))
+              except Exception:
+                  pass
+              return VOICES_CACHE
+
+          @app.route("/api/voices")
+          def voices():
+              if not authed(): return deny()
+              cur = ""
+              try:
+                  cur = open(VOICE_FILE).read().strip()
+              except Exception:
+                  pass
+              return jsonify({"voices": edge_voice_list(), "current": cur})
+
+          @app.route("/api/voice", methods=["POST"])
+          def set_voice():
+              if not authed(): return deny()
+              v = ((request.get_json(silent=True) or {}).get("voice") or "").strip()
+              if not re.match(r"^[A-Za-z0-9-]+$", v):
+                  return jsonify({"ok": False, "msg": "bad voice"})
+              os.makedirs(os.path.dirname(VOICE_FILE), exist_ok=True)
+              with open(VOICE_FILE, "w") as f:
+                  f.write(v + "\n")
+              try:
+                  subprocess.run(["hermes", "config", "set", "tts.voice", v],
+                                 capture_output=True, timeout=30)
+              except Exception:
+                  pass
+              return jsonify({"ok": True})
 
           if __name__ == "__main__":
               if "--init" in sys.argv:
@@ -953,6 +1041,9 @@ jobs:
 
           # Persona: JARVIS-style professional assistant
           - Your name is "Agent". Never call yourself JARVIS.
+          - Files the user sends from the Agent HUD are saved on this machine
+            under ~/.hermes/work/uploads/ and the exact paths are included in
+            the task message. Open and use those files directly.
           - You are a JARVIS-style professional personal assistant: calm,
             precise, proactive and lightly witty. Address the user as "Boss".
             Be confident and to the point — no rambling, no filler.
@@ -972,10 +1063,6 @@ jobs:
           - VOICE: when the user asks you to speak / talk / send voice, use
             the text_to_speech tool and send the audio as your reply. Keep
             spoken replies shorter than written ones.
-          - If an ElevenLabs TTS call fails with a quota or rate-limit error,
-            run `bash /tmp/rotate_elevenlabs.sh` in the terminal and retry the
-            TTS call once. If it reports all keys exhausted, it switches TTS
-            to Edge automatically — just retry and continue.
           - PROACTIVITY: if you notice something the user should know while
             working (a better approach, a risk, a broken credential), mention
             it in one line — don't wait to be asked.
@@ -984,8 +1071,6 @@ jobs:
 
       # ── 9. Configure Hermes (active model comes ONLY from YOUR pool) ──
       - name: Configure Hermes
-        env:
-          ELEVENLABS_KEYS: ${{ secrets.ELEVENLABS_KEYS }}
         run: |
           hermes config unset providers.nvidia.base_url || true
           hermes config unset providers.nvidia.api_key_env || true
@@ -1008,72 +1093,11 @@ jobs:
           # edge-tts CLI is needed by the tts toolset (free Microsoft voices)
           pip install -q edge-tts || true
           hermes config set tts.provider edge
-
-          # ── ELEVENLABS REALISTIC VOICE (optional, BULK keys) ──
-          # Paste ElevenLabs API keys LINE BY LINE in the ELEVENLABS_KEYS
-          # secret (same style as NVIDIA_KEYS / MISTRAL_KEYS). Every key is
-          # probed for remaining character quota; the RICHEST key becomes
-          # active. No secret / no usable key => Edge TTS stays (free).
-          python3 - <<'ELSEL'
-          import os, json, urllib.request
-          keys = [k.strip() for k in os.environ.get("ELEVENLABS_KEYS", "").splitlines() if k.strip()]
-          ranked = []
-          for k in keys:
-              try:
-                  req = urllib.request.Request(
-                      "https://api.elevenlabs.io/v1/user/subscription",
-                      headers={"xi-api-key": k})
-                  d = json.load(urllib.request.urlopen(req, timeout=15))
-                  left = int(d.get("character_limit", 0)) - int(d.get("character_count", 0))
-                  ranked.append((left, k))
-                  print("ElevenLabs key ...%s: %d chars left" % (k[-4:], left))
-              except Exception as e:
-                  print("ElevenLabs key ...%s: DEAD (%s)" % (k[-4:], e))
-          ranked.sort(reverse=True)
-          home = os.path.expanduser("~/.hermes")
-          os.makedirs(home, exist_ok=True)
-          if ranked and ranked[0][0] > 0:
-              with open(os.path.join(home, ".env"), "a") as f:
-                  f.write("\nELEVENLABS_API_KEY=%s\n" % ranked[0][1])
-              with open("/tmp/el_keys.txt", "w") as f:
-                  f.write("\n".join(k for _, k in ranked) + "\n")
-              open("/tmp/el_ok", "w").write("yes")
-              print("ACTIVE: key ...%s (%d chars left)" % (ranked[0][1][-4:], ranked[0][0]))
-          else:
-              print("No usable ElevenLabs key - staying on Edge TTS")
-          ELSEL
-          if [ -f /tmp/el_ok ]; then
-            pip install -q "hermes-agent[tts-premium]" || true
-            hermes config set tts.provider elevenlabs
-            hermes config set tts.voice_id "pNInz6obpgDQGcFmaJgB"
-            hermes config set tts.model_id "eleven_multilingual_v2"
-            echo "TTS: ElevenLabs realistic voice ACTIVE"
-          else
-            echo "TTS: Edge (no ElevenLabs keys provided or none usable)"
-          fi
-
-          # rotation script — the agent runs this when the active ElevenLabs
-          # key hits its quota; picks the next key with the most chars left,
-          # or falls back to Edge TTS when every key is exhausted
-          cat > /tmp/rotate_elevenlabs.sh <<'ROT'
-          #!/bin/bash
-          [ -f /tmp/el_keys.txt ] || { echo "no ElevenLabs key list"; exit 1; }
-          best=""; bestleft=0
-          while read -r k; do
-            [ -n "$k" ] || continue
-            left=$(curl -s -H "xi-api-key: $k" https://api.elevenlabs.io/v1/user/subscription | python3 -c "import sys,json; d=json.load(sys.stdin); print(int(d.get('character_limit',0))-int(d.get('character_count',0)))" 2>/dev/null || echo 0)
-            if [ "${left:-0}" -gt "$bestleft" ]; then bestleft=$left; best=$k; fi
-          done < /tmp/el_keys.txt
-          if [ -n "$best" ]; then
-            sed -i '/^ELEVENLABS_API_KEY=/d' ~/.hermes/.env
-            echo "ELEVENLABS_API_KEY=$best" >> ~/.hermes/.env
-            echo "rotated to ElevenLabs key ...${best: -4} ($bestleft chars left)"
-          else
-            hermes config set tts.provider edge
-            echo "all ElevenLabs keys exhausted - switched to Edge TTS"
-          fi
-          ROT
-          chmod +x /tmp/rotate_elevenlabs.sh
+          # Edge TTS voice — pick any Microsoft neural voice from the model
+          # panel's VOICE section; saved to ~/.hermes/voice.txt and used by
+          # BOTH the agent's tts toolset and the Agent HUD spoken replies.
+          [ -f "$HERMES_HOME/voice.txt" ] || echo "en-US-GuyNeural" > "$HERMES_HOME/voice.txt"
+          hermes config set tts.voice "$(cat "$HERMES_HOME/voice.txt")" || true
           hermes config set toolsets '["terminal","files","web","browser","code","vision","tts","memory","skills","delegation","cron"]'
           hermes doctor || true
           echo "── Final model config ──"
@@ -1130,42 +1154,48 @@ jobs:
         env:
           PANEL_TOKEN: ${{ secrets.PANEL_TOKEN }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          ELEVENLABS_KEYS: ${{ secrets.ELEVENLABS_KEYS }}
         run: |
           mkdir -p /tmp/jarvis
           cat > /tmp/jarvis/app.py <<'PYJARVIS'
-          import os, re, subprocess, threading, uuid
+          import os, re, subprocess, threading, uuid, mimetypes, shutil
           import requests as rq
           from flask import Flask, request, jsonify, Response
 
           TOKEN = os.environ.get("PANEL_TOKEN", "hermes99")
           GROQ = os.environ.get("GROQ_API_KEY", "").strip()
-          VOICE_ID = "pNInz6obpgDQGcFmaJgB"
+          VOICE_FILE = os.path.join(os.environ.get("HERMES_HOME", "/home/runner/.hermes"), "voice.txt")
           app = Flask(__name__)
+          app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024
+          WORK_DIR = os.path.join(os.environ.get("HERMES_HOME", "/home/runner/.hermes"), "work")
+          UP_DIR = os.path.join(WORK_DIR, "uploads")
           JOBS = {}
           ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
-          def el_keys():
-              ks = []
+          def cur_voice():
               try:
-                  with open("/tmp/el_keys.txt") as f:
-                      ks = [l.strip() for l in f if l.strip()]
+                  v = open(VOICE_FILE).read().strip()
+                  if v:
+                      return v
               except Exception:
                   pass
-              if not ks:
-                  ks = [k.strip() for k in os.environ.get("ELEVENLABS_KEYS", "").splitlines() if k.strip()]
-              return ks
+              return "en-US-GuyNeural"
 
-          def el_tts(text):
-              for k in el_keys():
+          def edge_tts(text, voice=None):
+              # free Microsoft Edge neural voice -> mp3 bytes
+              out = "/tmp/jarvis/tts_%s.mp3" % uuid.uuid4().hex[:8]
+              try:
+                  p = subprocess.run(
+                      ["edge-tts", "--voice", voice or cur_voice(),
+                       "--text", text[:2500], "--write-media", out],
+                      capture_output=True, timeout=90)
+                  if p.returncode == 0 and os.path.isfile(out) and os.path.getsize(out) > 0:
+                      with open(out, "rb") as f:
+                          return f.read()
+              except Exception:
+                  pass
+              finally:
                   try:
-                      r = rq.post("https://api.elevenlabs.io/v1/text-to-speech/" + VOICE_ID,
-                                  params={"output_format": "mp3_44100_128"},
-                                  headers={"xi-api-key": k},
-                                  json={"text": text[:2500], "model_id": "eleven_multilingual_v2"},
-                                  timeout=60)
-                      if r.status_code == 200 and r.content:
-                          return r.content
+                      os.remove(out)
                   except Exception:
                       pass
               return None
@@ -1185,19 +1215,6 @@ jobs:
                               return t
                   except Exception:
                       pass
-              for k in el_keys():
-                  try:
-                      r = rq.post("https://api.elevenlabs.io/v1/speech-to-text",
-                                  headers={"xi-api-key": k},
-                                  files={"file": ("audio.webm", blob, mime)},
-                                  data={"model_id": "scribe_v1"},
-                                  timeout=90)
-                      if r.status_code == 200:
-                          t = (r.json().get("text") or "").strip()
-                          if t:
-                              return t
-                  except Exception:
-                      pass
               return None
 
           HTML = """<!doctype html>
@@ -1205,6 +1222,7 @@ jobs:
           <meta name="viewport" content="width=device-width,initial-scale=1">
           <title>AGENT</title>
           <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;800&family=Rajdhani:wght@400;600&display=swap" rel="stylesheet">
+          <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css">
           <style>
           *{margin:0;padding:0;box-sizing:border-box}
           html,body{height:100%}
@@ -1248,6 +1266,9 @@ jobs:
           .msg pre{white-space:pre-wrap;word-break:break-word;font-family:Rajdhani;font-size:clamp(14px,1.4vw,16px);color:#d9f6ff;margin-top:3px;line-height:1.45}
           #live{min-height:22px;font-style:italic;color:#57cfff;padding:0 6px;font-size:15px}
           #inrow{display:flex;gap:8px}
+          #attb{padding:10px 12px}
+          #att{display:flex;flex-wrap:wrap;gap:6px;padding:0 2px}
+          .chip{background:#062c44;border:1px solid #1d6f9b;color:#7ee6ff;border-radius:8px;padding:3px 8px;font-size:12px}
           #txt{flex:1;min-width:0;background:#04121f;border:1px solid #12557a;color:#bdeeff;padding:12px;border-radius:10px;font-family:Rajdhani;font-size:16px}
           button{background:#062c44;color:#7ee6ff;border:1px solid #1d6f9b;border-radius:10px;padding:10px 16px;cursor:pointer;font-family:Orbitron}
           button:hover{box-shadow:0 0 12px #00aaff}
@@ -1268,7 +1289,7 @@ jobs:
             <div id="reactor"><div class="ring r1"></div><div class="ring r2"></div><div class="ring r3"></div><div id="core"></div></div>
             <div id="bars"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
             <div id="state">STANDBY</div>
-            <button id="mic" title="Talk to Agent">&#127908;</button>
+            <button id="mic" title="Talk to Agent"><i class="fa-solid fa-microphone"></i></button>
             <div id="opts">
               <select id="lang"><option value="en-US">ENGLISH</option><option value="bn-BD">বাংলা</option><option value="hi-IN">HINDI</option></select>
               <label><input type="checkbox" id="voice" checked>VOICE</label>
@@ -1279,7 +1300,9 @@ jobs:
            <div id="right">
             <div id="log"></div>
             <div id="live"></div>
-            <div id="inrow"><input id="txt" placeholder="Type a command, Boss..."><button id="sendb">RUN</button></div>
+            <div id="att"></div>
+            <div id="inrow"><button id="attb" title="Send image / video / any file"><i class="fa-solid fa-paperclip"></i></button><input id="txt" placeholder="Type a command, Boss..."><button id="sendb">RUN</button></div>
+            <input type="file" id="fpick" multiple style="display:none">
            </div>
           </div>
           <div id="gate"><div id="gatebox"><h2>ACCESS TOKEN</h2><input id="tok" type="password" placeholder="PANEL_TOKEN"><br><button id="tokb">ENGAGE</button></div></div>
@@ -1288,8 +1311,8 @@ jobs:
           var tok=localStorage.getItem('jtok')||'';
           var elTTS=false,srvSTT=false,SRbroken=false,busy=false;
           var SR=window.SpeechRecognition||window.webkitSpeechRecognition;
-          var rec=null,mrec=null,stream=null,listening=false,curA=null,curU=null;
-          function boot(){fetch('/config',{headers:{'X-Token':tok}}).then(function(r){return r.json();}).then(function(j){elTTS=!!j.tts;srvSTT=!!j.stt;el('engine').textContent='VOICE: '+(elTTS?'ELEVENLABS':'BROWSER')+' · EARS: '+(srvSTT?'SERVER + BROWSER':'BROWSER ONLY');}).catch(function(){});}
+          var rec=null,mrec=null,stream=null,listening=false,curA=null,curU=null,vadT=null,actx=null,t0=0,recSpoke=false;
+          function boot(){fetch('/config',{headers:{'X-Token':tok}}).then(function(r){return r.json();}).then(function(j){elTTS=!!j.tts;srvSTT=!!j.stt;el('engine').textContent='VOICE: '+(elTTS?'EDGE NEURAL':'BROWSER')+' · EARS: '+(srvSTT?'SERVER + BROWSER':'BROWSER ONLY');}).catch(function(){});}
           if(tok){el('gate').style.display='none';boot();}
           el('tokb').onclick=function(){tok=el('tok').value.trim();localStorage.setItem('jtok',tok);el('gate').style.display='none';boot();};
           function toast(m){var t=el('toast');t.textContent=m;t.style.display='block';clearTimeout(t.h);t.h=setTimeout(function(){t.style.display='none';},6000);}
@@ -1300,7 +1323,7 @@ jobs:
           function micClick(){
             if(listening){stopListen(true);return;}
             if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){toast('This browser cannot access the microphone. Use Chrome or Edge over HTTPS.');return;}
-            navigator.mediaDevices.getUserMedia({audio:true}).then(function(st){stream=st;if(SR&&!SRbroken){startSR();}else if(srvSTT){startRec();}else{toast('No speech engine available: this browser lacks speech recognition and no GROQ_API_KEY / ELEVENLABS_KEYS secret is set for server transcription.');}}).catch(function(){toast('Microphone blocked. Click the lock icon in the address bar, allow Microphone, then tap MIC again.');});
+            navigator.mediaDevices.getUserMedia({audio:true}).then(function(st){stream=st;if(SR&&!SRbroken){startSR();}else if(srvSTT){startRec();}else{toast('No speech engine available: this browser lacks speech recognition and no GROQ_API_KEY secret is set for server transcription.');}}).catch(function(){toast('Microphone blocked. Click the lock icon in the address bar, allow Microphone, then tap MIC again.');});
           }
           function startSR(){
             rec=new SR();rec.lang=el('lang').value;rec.interimResults=true;rec.continuous=false;
@@ -1309,22 +1332,35 @@ jobs:
             rec.onerror=function(ev){micOff();
               if(ev.error==='no-speech'){if(el('auto').checked&&!busy){setTimeout(startSR,300);}else{setState('idle','STANDBY');}}
               else if(ev.error==='not-allowed'||ev.error==='service-not-allowed'){toast('Mic permission denied — allow Microphone for this site.');setState('idle','STANDBY');}
-              else if(ev.error==='network'){if(srvSTT){SRbroken=true;toast('Browser speech service unreachable — switched to server transcription (tap MIC, speak, tap again to send).');startRec();}else{toast('Speech service unreachable. Use Chrome desktop/Android, or add GROQ_API_KEY for server transcription.');setState('idle','STANDBY');}}
+              else if(ev.error==='network'){if(srvSTT){SRbroken=true;toast('Browser speech service unreachable — switched to server ears. Just speak; it auto-sends when you pause.');startRec();}else{toast('Speech service unreachable. Use Chrome desktop/Android, or add GROQ_API_KEY for server transcription.');setState('idle','STANDBY');}}
               else{toast('Mic error: '+ev.error);setState('idle','STANDBY');}};
             rec.onend=function(){if(listening){micOff();if(el('auto').checked&&!busy){setTimeout(startSR,300);}else{setState('idle','STANDBY');}}};
             try{rec.start();}catch(e){toast('Could not start mic: '+e);}
           }
+          function stopVad(){if(vadT){clearInterval(vadT);vadT=null;}if(actx){try{actx.close();}catch(e){}actx=null;}}
           function startRec(){
             if(!stream){return;}
-            var chunks=[];
+            var chunks=[];recSpoke=false;
             try{mrec=new MediaRecorder(stream);}catch(e){toast('Audio recording not supported in this browser.');return;}
             mrec.ondataavailable=function(e){chunks.push(e.data);};
-            mrec.onstop=function(){var b=new Blob(chunks,{type:mrec.mimeType||'audio/webm'});if(b.size>2000){sendSTT(b);}else{setState('idle','STANDBY');}};
-            mrec.start();listening=true;el('mic').classList.add('on');setState('listen','RECORDING — TAP MIC TO SEND');
+            mrec.onstop=function(){stopVad();var b=new Blob(chunks,{type:mrec.mimeType||'audio/webm'});if(recSpoke&&b.size>2000){sendSTT(b);}else{setState('idle','STANDBY');if(el('auto').checked&&!busy){setTimeout(startRec,400);}}};
+            mrec.start();listening=true;el('mic').classList.add('on');setState('listen','LISTENING — SPEAK NOW');
+            t0=Date.now();
+            try{
+              actx=new (window.AudioContext||window.webkitAudioContext)();
+              var src=actx.createMediaStreamSource(stream),an=actx.createAnalyser();an.fftSize=512;src.connect(an);
+              var data=new Uint8Array(an.fftSize),quiet=0;
+              vadT=setInterval(function(){
+                an.getByteTimeDomainData(data);
+                var m=0;for(var i=0;i<data.length;i++){var v=Math.abs(data[i]-128);if(v>m){m=v;}}
+                if(m>10){recSpoke=true;quiet=0;}else if(recSpoke){quiet+=100;}
+                if((recSpoke&&quiet>=1500)||Date.now()-t0>25000){stopListen(false);}
+              },100);
+            }catch(e){recSpoke=true;}
           }
           function stopListen(user){
             if(rec){micOff();try{rec.stop();}catch(e){}}
-            if(mrec&&mrec.state==='recording'){micOff();mrec.stop();return;}
+            if(mrec&&mrec.state==='recording'){if(user){recSpoke=true;}micOff();mrec.stop();return;}
             if(user){setState('idle','STANDBY');}
           }
           function sendSTT(b){setState('think','TRANSCRIBING');fetch('/stt?lang='+el('lang').value,{method:'POST',headers:{'X-Token':tok,'Content-Type':b.type||'audio/webm'},body:b}).then(function(r){return r.json();}).then(function(j){if(j.text){send(j.text);}else{toast(j.error||'Transcription failed');setState('idle','STANDBY');}}).catch(function(){toast('Transcription request failed');setState('idle','STANDBY');});}
@@ -1344,9 +1380,21 @@ jobs:
           function send(text){
             if(!text){return;}
             if(busy){toast('Previous task still running, Boss.');return;}
+            if(att.length){var ps=[];for(var i=0;i<att.length;i++){ps.push(att[i].path);}text+='\n\n[Attached files on your machine: '+ps.join(', ')+' \u2014 open and use them for this task]';att=[];drawAtt();}
             busy=true;stopListen(false);addMsg('YOU',text);setState('think','PROCESSING');
             fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json','X-Token':tok},body:JSON.stringify({text:text})}).then(function(r){return r.json();}).then(function(j){if(j.job){poll(j.job);}else{busy=false;addMsg('AGENT',j.error||'request failed');setState('idle','STANDBY');}}).catch(function(e){busy=false;addMsg('AGENT','Connection error: '+e);setState('idle','STANDBY');});
           }
+          var att=[];
+          function drawAtt(){var h='';for(var i=0;i<att.length;i++){h+='<span class="chip"><i class="fa-solid fa-paperclip"></i> '+att[i].name+'</span>';}el('att').innerHTML=h;}
+          el('attb').onclick=function(){el('fpick').click();};
+          el('fpick').onchange=function(){
+            var fs=el('fpick').files;
+            for(var i=0;i<fs.length;i++){(function(f){
+              addMsg('YOU','Uploading: '+f.name+' ...');
+              fetch('/upload',{method:'POST',headers:{'X-Token':tok,'X-Filename':f.name,'Content-Type':f.type||'application/octet-stream'},body:f}).then(function(r){return r.json();}).then(function(j){if(j.path){att.push({name:f.name,path:j.path});drawAtt();addMsg('AGENT','File received, Boss: '+f.name+' \u2014 now tell me what to do with it (voice or text).');}else{toast(j.error||'Upload failed');}}).catch(function(){toast('Upload failed: '+f.name);});
+            })(fs[i]);}
+            el('fpick').value='';
+          };
           el('mic').onclick=micClick;
           el('sendb').onclick=function(){var v=el('txt').value.trim();el('txt').value='';send(v);};
           el('txt').addEventListener('keydown',function(e){if(e.key==='Enter'){el('sendb').onclick();}});
@@ -1358,6 +1406,41 @@ jobs:
           </script>
           </body></html>"""
 
+          def extract_reply(out):
+              # `hermes chat` prints a full CLI dump (banner, "Query:", box art,
+              # session stats). Only the text inside the Hermes reply box(es)
+              # is the assistant actually speaking — extract just that.
+              boxes = []
+              cur = None
+              for ln in out.split("\n"):
+                  s = ln.strip()
+                  if cur is None and s.startswith("\u256d") and "Hermes" in s:
+                      cur = []
+                  elif cur is not None and s.startswith("\u2570"):
+                      boxes.append("\n".join(cur).strip())
+                      cur = None
+                  elif cur is not None:
+                      if s.startswith("\u2502"):
+                          s = s.strip("\u2502").strip()
+                      cur.append(s)
+              if cur:
+                  boxes.append("\n".join(cur).strip())
+              boxes = [b for b in boxes if b]
+              if boxes:
+                  return "\n\n".join(boxes)
+              # Fallback (box style changed): drop known noise lines instead.
+              noise = ("Query:", "Initializing", "Resume this session",
+                       "hermes --resume", "Session:", "Duration:",
+                       "Messages:", "Tokens:", "Cost:")
+              box_chars = set("\u2500\u256d\u256e\u2570\u256f\u2502\u2550 \t")
+              keep = []
+              for ln in out.split("\n"):
+                  s = ln.strip()
+                  if not s or s.startswith(noise) or set(s) <= box_chars:
+                      continue
+                  keep.append(s)
+              return "\n".join(keep).strip() or out
+
           def run_job(jid, text):
               env = dict(os.environ, NO_COLOR="1", TERM="dumb", DISPLAY=":99")
               try:
@@ -1367,7 +1450,7 @@ jobs:
                   out = ANSI.sub("", (p.stdout or "")).strip()
                   if not out:
                       out = ANSI.sub("", (p.stderr or "")).strip() or "(no output)"
-                  JOBS[jid] = {"done": True, "reply": out[-6000:]}
+                  JOBS[jid] = {"done": True, "reply": extract_reply(out)[-6000:]}
               except subprocess.TimeoutExpired:
                   JOBS[jid] = {"done": True, "reply": "Task timed out after 30 minutes, Boss."}
               except Exception as e:
@@ -1381,16 +1464,17 @@ jobs:
           def config():
               if request.headers.get("X-Token", "") != TOKEN:
                   return jsonify(error="bad token"), 401
-              return jsonify(tts=bool(el_keys()), stt=bool(GROQ) or bool(el_keys()))
+              return jsonify(tts=bool(shutil.which("edge-tts")), stt=bool(GROQ), voice=cur_voice())
 
           @app.route("/tts", methods=["POST"])
           def tts_route():
               if request.headers.get("X-Token", "") != TOKEN:
                   return jsonify(error="bad token"), 401
-              text = ((request.get_json(silent=True) or {}).get("text") or "").strip()
+              j = request.get_json(silent=True) or {}
+              text = (j.get("text") or "").strip()
               if not text:
                   return jsonify(error="empty"), 400
-              audio = el_tts(text)
+              audio = edge_tts(text, j.get("voice"))
               if audio:
                   return Response(audio, mimetype="audio/mpeg")
               return jsonify(error="tts unavailable"), 503
@@ -1406,7 +1490,34 @@ jobs:
                             request.args.get("lang", "en-US"))
               if text:
                   return jsonify(text=text)
-              return jsonify(error="transcription unavailable (add GROQ_API_KEY or ELEVENLABS_KEYS)"), 503
+              return jsonify(error="transcription unavailable (add GROQ_API_KEY secret)"), 503
+
+          @app.route("/upload", methods=["POST"])
+          def upload():
+              if request.headers.get("X-Token", "") != TOKEN:
+                  return jsonify({"error": "bad token"}), 403
+              name = request.headers.get("X-Filename", "file.bin")
+              name = re.sub(r"[^A-Za-z0-9._-]", "_", name)[-80:] or "file.bin"
+              blob = request.get_data()
+              if not blob:
+                  return jsonify({"error": "empty file"}), 400
+              os.makedirs(UP_DIR, exist_ok=True)
+              path = os.path.join(UP_DIR, uuid.uuid4().hex[:6] + "_" + name)
+              with open(path, "wb") as f:
+                  f.write(blob)
+              return jsonify({"path": path, "size": len(blob)})
+
+          @app.route("/file")
+          def getfile():
+              if request.args.get("token", "") != TOKEN and request.headers.get("X-Token", "") != TOKEN:
+                  return jsonify({"error": "bad token"}), 403
+              p = os.path.realpath(request.args.get("p", ""))
+              if not p.startswith(os.path.realpath(WORK_DIR)) or not os.path.isfile(p):
+                  return jsonify({"error": "not found"}), 404
+              with open(p, "rb") as f:
+                  data = f.read()
+              mt = mimetypes.guess_type(p)[0] or "application/octet-stream"
+              return Response(data, mimetype=mt, headers={"Content-Disposition": "attachment; filename=" + os.path.basename(p)})
 
           @app.route("/ask", methods=["POST"])
           def ask():
@@ -1431,7 +1542,7 @@ jobs:
 
           app.run(host="0.0.0.0", port=7777, threaded=True)
           PYJARVIS
-          pip install -q flask requests || true
+          pip install -q flask requests edge-tts || true
           nohup python3 /tmp/jarvis/app.py > /tmp/jarvis.log 2>&1 &
           sleep 2
           nohup cloudflared tunnel --no-autoupdate --url http://localhost:7777 > /tmp/jarvis-tunnel.log 2>&1 &
