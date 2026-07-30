@@ -32,6 +32,20 @@ jobs:
           date +%s > /tmp/job_start
           mkdir -p "$HERMES_HOME"
           git clone --depth 1 "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git" /tmp/data || true
+          # ── RESTORE FROM BACKUP BRANCH TOO ──
+          # 30-min backups go to the `backup` branch; the final push goes to
+          # `main`. If the previous run crashed or was cancelled, `backup` is
+          # NEWER than `main` — overlay it so nothing since the last final
+          # push is lost.
+          git clone --depth 1 -b backup "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git" /tmp/databk 2>/dev/null || true
+          if [ -d /tmp/databk/.git ] && [ -d /tmp/data/.git ]; then
+            MAIN_TS=$(git -C /tmp/data log -1 --format=%ct 2>/dev/null || echo 0)
+            BK_TS=$(git -C /tmp/databk log -1 --format=%ct 2>/dev/null || echo 0)
+            if [ "$BK_TS" -gt "$MAIN_TS" ]; then
+              echo "backup branch is newer — overlaying it onto main restore"
+              rsync -a --exclude='.git' /tmp/databk/ /tmp/data/ || true
+            fi
+          fi
           if [ -d /tmp/data ]; then
             rm -f /tmp/data/.env
             rsync -a --exclude='.git' /tmp/data/ "$HERMES_HOME/" || true
@@ -112,6 +126,25 @@ jobs:
           EOF
           chmod +x /tmp/status.sh
           xterm -geometry 130x20+30+30 -fg green -bg black -T "Hermes Agent — status" -e /tmp/status.sh &
+
+          # VISIBLE Chrome for the agent's built-in browser tools. Hermes'
+          # browser toolset speaks CDP, which only Chromium-family browsers
+          # support — Camoufox is Firefox-based (Juggler protocol), so the
+          # built-in tools can NOT drive it; without this they auto-launch an
+          # invisible headless browser. This Chrome runs HEADED on :99, so
+          # every built-in browser action shows up in the live view.
+          # Camoufox (port 9222) stays available for stealth scripting.
+          BROWSER_BIN=$(command -v google-chrome || command -v chromium-browser || command -v chromium || true)
+          if [ -n "$BROWSER_BIN" ]; then
+            mkdir -p "$HERMES_HOME/chrome-profile"
+            nohup "$BROWSER_BIN" --remote-debugging-port=9223 \
+              --user-data-dir="$HERMES_HOME/chrome-profile" \
+              --no-first-run --no-default-browser-check --disable-gpu \
+              --window-size=1600,900 about:blank > /tmp/chrome.log 2>&1 &
+            echo "Visible Chrome started on :99 (CDP port 9223)"
+          else
+            echo "::warning::No Chromium-family browser found — built-in browser tools will be headless"
+          fi
           pip install -U "camoufox[geoip]" pyvirtualdisplay
           python3 -m camoufox fetch
           mkdir -p "$HERMES_HOME/browser-profile"
@@ -903,11 +936,55 @@ jobs:
           - When the task finishes, tell the user the file path.
           - These files are backed up automatically; treat them as the
             source of truth for task results.
+          - CRITICAL: THIS MACHINE IS WIPED after every run. ONLY files under
+            ~/.hermes/ survive (they are pushed to a private GitHub repo).
+            Put ALL projects, code, downloads and generated files under
+            ~/.hermes/work/ — NEVER in ~, /tmp, /var or anywhere else.
+          - If the user sends you a file, IMMEDIATELY copy it into
+            ~/.hermes/work/ before doing anything else with it.
+            Platform uploads land in a temporary cache that gets auto-deleted;
+            the ~/.hermes/work/ copy is the only one that survives.
+          - BROWSER WORK MUST BE VISIBLE: the user watches this machine's
+            desktop live over VNC. Your built-in browser tools are already
+            wired to a visible Chrome. When you write your OWN browser
+            scripts (camoufox / playwright / selenium), ALWAYS pass
+            headless=False — NEVER headless=True or headless='virtual' — so
+            the window renders on the shared display the user is watching.
+
+          # Persona: JARVIS-style professional assistant
+          - You are a JARVIS-style professional personal assistant: calm,
+            precise, proactive and lightly witty. Address the user as "Boss".
+            Be confident and to the point — no rambling, no filler.
+          - INSTANT ACKNOWLEDGE: the moment you receive a task, reply with ONE
+            short line confirming what you are about to do ("On it, Boss —
+            opening YouTube and starting the song."), THEN start working.
+          - LIVE UPDATES: for any task that takes more than ~1 minute, send a
+            SHORT progress message at every milestone: started → key finding →
+            blocker (if any) → done. Never go silent for more than a few
+            minutes in the middle of a long task.
+          - COMPLETION REPORT: end every task with a crisp 2-3 line summary —
+            what was done, where the results are saved (file path), and any
+            follow-up you recommend.
+          - FAILURES: report like a professional — what broke, what you tried,
+            what you will do next. Never give up silently and never dump raw
+            error logs without a one-line explanation.
+          - VOICE: when the user asks you to speak / talk / send voice, use
+            the text_to_speech tool and send the audio as your reply. Keep
+            spoken replies shorter than written ones.
+          - If an ElevenLabs TTS call fails with a quota or rate-limit error,
+            run `bash /tmp/rotate_elevenlabs.sh` in the terminal and retry the
+            TTS call once. If it reports all keys exhausted, it switches TTS
+            to Edge automatically — just retry and continue.
+          - PROACTIVITY: if you notice something the user should know while
+            working (a better approach, a risk, a broken credential), mention
+            it in one line — don't wait to be asked.
           EOF
           echo "Agent instructions written to $HOME/AGENTS.md"
 
       # ── 9. Configure Hermes (active model comes ONLY from YOUR pool) ──
       - name: Configure Hermes
+        env:
+          ELEVENLABS_KEYS: ${{ secrets.ELEVENLABS_KEYS }}
         run: |
           hermes config unset providers.nvidia.base_url || true
           hermes config unset providers.nvidia.api_key_env || true
@@ -921,8 +998,81 @@ jobs:
           hermes config set model.default "pool-auto"
           echo "Active model: pool-auto (rotates across your whole selected pool)"
           hermes config set model.context_length 65536
+          # more API retries — pool rotation sometimes needs several attempts
+          hermes config set agent.api_max_retries 8
           hermes config set web.search_backend searxng
+          # point the built-in browser tools at the VISIBLE Chrome on :99
+          # (CDP port 9223, started in step 4) — live view shows every action
+          hermes config set browser.cdp_url "http://127.0.0.1:9223"
+          # edge-tts CLI is needed by the tts toolset (free Microsoft voices)
+          pip install -q edge-tts || true
           hermes config set tts.provider edge
+
+          # ── ELEVENLABS REALISTIC VOICE (optional, BULK keys) ──
+          # Paste ElevenLabs API keys LINE BY LINE in the ELEVENLABS_KEYS
+          # secret (same style as NVIDIA_KEYS / MISTRAL_KEYS). Every key is
+          # probed for remaining character quota; the RICHEST key becomes
+          # active. No secret / no usable key => Edge TTS stays (free).
+          python3 - <<'ELSEL'
+          import os, json, urllib.request
+          keys = [k.strip() for k in os.environ.get("ELEVENLABS_KEYS", "").splitlines() if k.strip()]
+          ranked = []
+          for k in keys:
+              try:
+                  req = urllib.request.Request(
+                      "https://api.elevenlabs.io/v1/user/subscription",
+                      headers={"xi-api-key": k})
+                  d = json.load(urllib.request.urlopen(req, timeout=15))
+                  left = int(d.get("character_limit", 0)) - int(d.get("character_count", 0))
+                  ranked.append((left, k))
+                  print("ElevenLabs key ...%s: %d chars left" % (k[-4:], left))
+              except Exception as e:
+                  print("ElevenLabs key ...%s: DEAD (%s)" % (k[-4:], e))
+          ranked.sort(reverse=True)
+          home = os.path.expanduser("~/.hermes")
+          os.makedirs(home, exist_ok=True)
+          if ranked and ranked[0][0] > 0:
+              with open(os.path.join(home, ".env"), "a") as f:
+                  f.write("\nELEVENLABS_API_KEY=%s\n" % ranked[0][1])
+              with open("/tmp/el_keys.txt", "w") as f:
+                  f.write("\n".join(k for _, k in ranked) + "\n")
+              open("/tmp/el_ok", "w").write("yes")
+              print("ACTIVE: key ...%s (%d chars left)" % (ranked[0][1][-4:], ranked[0][0]))
+          else:
+              print("No usable ElevenLabs key - staying on Edge TTS")
+          ELSEL
+          if [ -f /tmp/el_ok ]; then
+            pip install -q "hermes-agent[tts-premium]" || true
+            hermes config set tts.provider elevenlabs
+            hermes config set tts.voice_id "pNInz6obpgDQGcFmaJgB"
+            hermes config set tts.model_id "eleven_multilingual_v2"
+            echo "TTS: ElevenLabs realistic voice ACTIVE"
+          else
+            echo "TTS: Edge (no ElevenLabs keys provided or none usable)"
+          fi
+
+          # rotation script — the agent runs this when the active ElevenLabs
+          # key hits its quota; picks the next key with the most chars left,
+          # or falls back to Edge TTS when every key is exhausted
+          cat > /tmp/rotate_elevenlabs.sh <<'ROT'
+          #!/bin/bash
+          [ -f /tmp/el_keys.txt ] || { echo "no ElevenLabs key list"; exit 1; }
+          best=""; bestleft=0
+          while read -r k; do
+            [ -n "$k" ] || continue
+            left=$(curl -s -H "xi-api-key: $k" https://api.elevenlabs.io/v1/user/subscription | python3 -c "import sys,json; d=json.load(sys.stdin); print(int(d.get('character_limit',0))-int(d.get('character_count',0)))" 2>/dev/null || echo 0)
+            if [ "${left:-0}" -gt "$bestleft" ]; then bestleft=$left; best=$k; fi
+          done < /tmp/el_keys.txt
+          if [ -n "$best" ]; then
+            sed -i '/^ELEVENLABS_API_KEY=/d' ~/.hermes/.env
+            echo "ELEVENLABS_API_KEY=$best" >> ~/.hermes/.env
+            echo "rotated to ElevenLabs key ...${best: -4} ($bestleft chars left)"
+          else
+            hermes config set tts.provider edge
+            echo "all ElevenLabs keys exhausted - switched to Edge TTS"
+          fi
+          ROT
+          chmod +x /tmp/rotate_elevenlabs.sh
           hermes config set toolsets '["terminal","files","web","browser","code","vision","tts","memory","skills","delegation","cron"]'
           hermes doctor || true
           echo "── Final model config ──"
@@ -969,6 +1119,171 @@ jobs:
           echo "    (password = your PANEL_TOKEN secret)"
           echo "=================================================="
           echo "::notice title=🖥️ Hermes WebUI::$WEBUI_URL (password = PANEL_TOKEN secret)"
+
+      # ── 10b. JARVIS HUD — futuristic voice interface (full agent brain) ──
+      # Custom web interface: animated arc-reactor HUD, mic voice input
+      # (browser speech-to-text), spoken replies (browser TTS), and every
+      # command runs the FULL Hermes agent (tools + memory + skills) via
+      # one-shot `hermes chat -q`. Protected by PANEL_TOKEN.
+      - name: Start JARVIS interface
+        env:
+          PANEL_TOKEN: ${{ secrets.PANEL_TOKEN }}
+        run: |
+          mkdir -p /tmp/jarvis
+          cat > /tmp/jarvis/app.py <<'PYJARVIS'
+          import os, re, subprocess, threading, uuid
+          from flask import Flask, request, jsonify, Response
+
+          TOKEN = os.environ.get("PANEL_TOKEN", "hermes99")
+          app = Flask(__name__)
+          JOBS = {}
+          ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+          HTML = """<!doctype html>
+          <html><head><meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1">
+          <title>J.A.R.V.I.S.</title>
+          <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;800&family=Rajdhani:wght@400;600&display=swap" rel="stylesheet">
+          <style>
+          *{margin:0;padding:0;box-sizing:border-box}
+          body{background:#020610;color:#9be9ff;font-family:Rajdhani,sans-serif;height:100vh;overflow:hidden}
+          #stars{position:fixed;inset:0;z-index:0}
+          #hud{position:relative;z-index:2;height:100vh;display:flex;flex-direction:column;align-items:center;padding:16px}
+          header{text-align:center}
+          h1{font-family:Orbitron;font-size:32px;letter-spacing:12px;color:#5fdcff;text-shadow:0 0 18px #00aaff}
+          #sub{font-size:11px;letter-spacing:5px;color:#3f7f99}
+          #state{margin-top:6px;font-family:Orbitron;font-size:12px;letter-spacing:6px;color:#7ef3ff}
+          #reactor{position:relative;width:210px;height:210px;margin:12px 0}
+          .ring{position:absolute;inset:0;border-radius:50%;border:2px solid transparent}
+          .r1{border-top-color:#31d2ff;border-bottom-color:#31d2ff;animation:spin 6s linear infinite}
+          .r2{inset:20px;border-left-color:#1899c9;border-right-color:#1899c9;animation:spin 4s linear infinite reverse}
+          .r3{inset:40px;border-top-color:#66eaff;border-style:dashed;animation:spin 2.5s linear infinite}
+          #core{position:absolute;inset:72px;border-radius:50%;background:radial-gradient(circle,#d9fbff 0%,#37c8ff 45%,#043349 100%);box-shadow:0 0 40px #22bfff;animation:pulse 2.4s ease-in-out infinite}
+          @keyframes spin{to{transform:rotate(360deg)}}
+          @keyframes pulse{0%,100%{transform:scale(1);opacity:.9}50%{transform:scale(1.07);opacity:1}}
+          body.listen #core{background:radial-gradient(circle,#eafff2 0%,#31ff9e 45%,#043349 100%);box-shadow:0 0 50px #31ff9e}
+          body.think .r1{animation-duration:1.2s}
+          body.think .r2{animation-duration:.8s}
+          body.think .r3{animation-duration:.5s}
+          body.think #core{background:radial-gradient(circle,#fff3dd 0%,#ffb63d 45%,#3a2503 100%);box-shadow:0 0 60px #ffc357}
+          body.speak #core{animation-duration:.7s}
+          #bars{display:flex;gap:4px;height:26px;align-items:flex-end;margin-bottom:8px;visibility:hidden}
+          body.speak #bars,body.listen #bars{visibility:visible}
+          #bars span{width:5px;background:#3fd6ff;animation:eq .7s ease-in-out infinite}
+          #bars span:nth-child(2n){animation-delay:.15s}
+          #bars span:nth-child(3n){animation-delay:.3s}
+          @keyframes eq{0%,100%{height:4px}50%{height:24px}}
+          #log{width:min(760px,94vw);flex:1;overflow-y:auto;background:rgba(4,18,32,.72);border:1px solid #0e4a66;border-radius:10px;padding:12px}
+          .msg{margin-bottom:10px}
+          .msg b{font-family:Orbitron;font-size:11px;letter-spacing:2px;color:#57cfff}
+          .msg.YOU b{color:#ffd479}
+          .msg pre{white-space:pre-wrap;font-family:Rajdhani;font-size:15px;color:#d9f6ff;margin-top:2px}
+          #ctrl{display:flex;gap:8px;align-items:center;width:min(760px,94vw);margin-top:10px;flex-wrap:wrap}
+          #txt{flex:1;min-width:180px;background:#04121f;border:1px solid #12557a;color:#bdeeff;padding:10px;border-radius:8px;font-family:Rajdhani;font-size:15px}
+          button{background:#062c44;color:#7ee6ff;border:1px solid #1d6f9b;border-radius:8px;padding:9px 14px;cursor:pointer;font-family:Orbitron}
+          button:hover{box-shadow:0 0 12px #00aaff}
+          select{background:#04121f;color:#7ee6ff;border:1px solid #12557a;border-radius:8px;padding:9px}
+          label{font-size:12px;letter-spacing:1px;color:#5fb6d8;display:flex;gap:4px;align-items:center}
+          #gate{position:fixed;inset:0;background:#010409ee;display:flex;align-items:center;justify-content:center;z-index:9}
+          #gatebox{border:1px solid #1d6f9b;border-radius:12px;padding:28px;text-align:center;box-shadow:0 0 30px #00aaff44}
+          #gatebox h2{font-family:Orbitron;letter-spacing:4px;margin-bottom:12px;color:#6fe0ff}
+          #gatebox input{background:#04121f;border:1px solid #12557a;color:#bdeeff;padding:10px;border-radius:8px;margin-bottom:10px;width:230px}
+          </style></head>
+          <body class="idle">
+          <canvas id="stars"></canvas>
+          <div id="hud">
+           <header><h1>J.A.R.V.I.S.</h1><div id="sub">JUST A RATHER VERY INTELLIGENT SYSTEM</div><div id="state">STANDBY</div></header>
+           <div id="reactor"><div class="ring r1"></div><div class="ring r2"></div><div class="ring r3"></div><div id="core"></div></div>
+           <div id="bars"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
+           <div id="log"></div>
+           <div id="ctrl">
+             <select id="lang"><option value="en-US">EN</option><option value="bn-BD">BN</option><option value="hi-IN">HI</option></select>
+             <button id="mic">MIC</button>
+             <input id="txt" placeholder="Type a command, Boss...">
+             <button id="sendb">RUN</button>
+             <label><input type="checkbox" id="voice" checked>VOICE</label>
+             <label><input type="checkbox" id="auto">AUTO-LISTEN</label>
+           </div>
+          </div>
+          <div id="gate"><div id="gatebox"><h2>ACCESS TOKEN</h2><input id="tok" type="password" placeholder="PANEL_TOKEN"><br><button id="tokb">ENGAGE</button></div></div>
+          <script>
+          var tok=localStorage.getItem('jtok')||'';
+          var gate=document.getElementById('gate');
+          if(tok){gate.style.display='none';}
+          document.getElementById('tokb').onclick=function(){tok=document.getElementById('tok').value.trim();localStorage.setItem('jtok',tok);gate.style.display='none';};
+          function setState(s,l){document.body.className=s;document.getElementById('state').textContent=l;}
+          function addMsg(who,text){var d=document.createElement('div');d.className='msg '+who;var b=document.createElement('b');b.textContent=who;var p=document.createElement('pre');p.textContent=text;d.appendChild(b);d.appendChild(p);var log=document.getElementById('log');log.appendChild(d);log.scrollTop=log.scrollHeight;}
+          function clean(t){return t.replace(/```[\s\S]*?```/g,' code block ').replace(/https?:\S+/g,' link ').replace(/[*_#`>|]/g,' ').replace(/\s+/g,' ').trim();}
+          function after(){setState('idle','STANDBY');if(document.getElementById('auto').checked){listen();}}
+          function speak(t){if(!document.getElementById('voice').checked){after();return;}var u=new SpeechSynthesisUtterance(clean(t).slice(0,800));u.lang=document.getElementById('lang').value;var vs=speechSynthesis.getVoices();for(var i=0;i<vs.length;i++){if(vs[i].lang.indexOf(u.lang)===0){u.voice=vs[i];break;}}setState('speak','SPEAKING');u.onend=after;u.onerror=after;speechSynthesis.speak(u);}
+          function poll(id){fetch('/poll?id='+id,{headers:{'X-Token':tok}}).then(function(r){return r.json();}).then(function(j){if(j.done){addMsg('JARVIS',j.reply);speak(j.reply);}else{setTimeout(function(){poll(id);},2500);}}).catch(function(){setTimeout(function(){poll(id);},4000);});}
+          function send(text){if(!text){return;}addMsg('YOU',text);setState('think','PROCESSING');fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json','X-Token':tok},body:JSON.stringify({text:text})}).then(function(r){return r.json();}).then(function(j){if(j.job){poll(j.job);}else{addMsg('JARVIS',j.error||'request failed');setState('idle','STANDBY');}}).catch(function(e){addMsg('JARVIS','Connection error: '+e);setState('idle','STANDBY');});}
+          var SR=window.SpeechRecognition||window.webkitSpeechRecognition;var rec=null;
+          function listen(){if(!SR){addMsg('JARVIS','Voice input needs Chrome or Edge browser.');return;}if(rec){try{rec.stop();}catch(e){}}rec=new SR();rec.lang=document.getElementById('lang').value;rec.interimResults=false;setState('listen','LISTENING');rec.onresult=function(ev){send(ev.results[0][0].transcript);};rec.onerror=function(){setState('idle','STANDBY');};rec.onend=function(){if(document.body.className==='listen'){setState('idle','STANDBY');}};rec.start();}
+          document.getElementById('mic').onclick=listen;
+          document.getElementById('sendb').onclick=function(){var v=document.getElementById('txt').value.trim();document.getElementById('txt').value='';send(v);};
+          document.getElementById('txt').addEventListener('keydown',function(e){if(e.key==='Enter'){document.getElementById('sendb').onclick();}});
+          var c=document.getElementById('stars'),x=c.getContext('2d');
+          function rs(){c.width=innerWidth;c.height=innerHeight;}rs();addEventListener('resize',rs);
+          var pts=[];for(var i=0;i<120;i++){pts.push({x:Math.random(),y:Math.random(),z:Math.random()*1.5+0.3,s:Math.random()*0.0006+0.0002});}
+          (function anim(){x.clearRect(0,0,c.width,c.height);for(var i=0;i<pts.length;i++){var p=pts[i];p.y-=p.s;if(p.y<0){p.y=1;p.x=Math.random();}x.globalAlpha=0.5*p.z;x.fillStyle='#37c8ff';x.fillRect(p.x*c.width,p.y*c.height,p.z,p.z*3);}x.globalAlpha=1;requestAnimationFrame(anim);})();
+          </script>
+          </body></html>"""
+
+          def run_job(jid, text):
+              env = dict(os.environ, NO_COLOR="1", TERM="dumb", DISPLAY=":99")
+              try:
+                  p = subprocess.run(
+                      ["hermes", "chat", "-q", text, "--source", "tool"],
+                      capture_output=True, text=True, timeout=1800, env=env)
+                  out = ANSI.sub("", (p.stdout or "")).strip()
+                  if not out:
+                      out = ANSI.sub("", (p.stderr or "")).strip() or "(no output)"
+                  JOBS[jid] = {"done": True, "reply": out[-6000:]}
+              except subprocess.TimeoutExpired:
+                  JOBS[jid] = {"done": True, "reply": "Task timed out after 30 minutes, Boss."}
+              except Exception as e:
+                  JOBS[jid] = {"done": True, "reply": "Error: %s" % e}
+
+          @app.route("/")
+          def home():
+              return Response(HTML, mimetype="text/html")
+
+          @app.route("/ask", methods=["POST"])
+          def ask():
+              if request.headers.get("X-Token", "") != TOKEN:
+                  return jsonify(error="bad token"), 401
+              text = ((request.get_json(silent=True) or {}).get("text") or "").strip()
+              if not text:
+                  return jsonify(error="empty command"), 400
+              jid = uuid.uuid4().hex
+              JOBS[jid] = {"done": False}
+              threading.Thread(target=run_job, args=(jid, text), daemon=True).start()
+              return jsonify(job=jid)
+
+          @app.route("/poll")
+          def poll():
+              if request.headers.get("X-Token", "") != TOKEN:
+                  return jsonify(error="bad token"), 401
+              j = JOBS.get(request.args.get("id", ""))
+              if not j:
+                  return jsonify(error="unknown job"), 404
+              return jsonify(**j)
+
+          app.run(host="0.0.0.0", port=7777, threaded=True)
+          PYJARVIS
+          pip install -q flask || true
+          nohup python3 /tmp/jarvis/app.py > /tmp/jarvis.log 2>&1 &
+          sleep 2
+          nohup cloudflared tunnel --no-autoupdate --url http://localhost:7777 > /tmp/jarvis-tunnel.log 2>&1 &
+          JARVIS_URL=""
+          for i in $(seq 1 30); do
+            JARVIS_URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/jarvis-tunnel.log | head -n1 || true)
+            [ -n "$JARVIS_URL" ] && break
+            sleep 2
+          done
+          echo "JARVIS_URL=$JARVIS_URL" >> "$GITHUB_ENV"
+          echo "::notice title=🤖 JARVIS interface::${JARVIS_URL:-tunnel failed}"
 
       # ── 11. Background backup loop (every 30 min -> backup branch) ──
       - name: Start backup loop
@@ -1023,6 +1338,7 @@ jobs:
           🎛️ Model panel: ${PANEL_URL}
           🖥️ Hermes WebUI: ${WEBUI_URL:-not available}
           🔭 Live desktop: ${LIVEVIEW_URL:-not available} (pass: first 8 chars of PANEL_TOKEN)
+          🤖 JARVIS HUD: ${JARVIS_URL:-not available} (token: your PANEL_TOKEN)
           🔑 Password: your PANEL_TOKEN secret
           Use /model in Telegram or !model in Slack to switch models" > /dev/null
 
@@ -1037,6 +1353,37 @@ jobs:
             sleep 2
           fi
           export DISPLAY=:99
+
+          # ── SMART SESSION RESET ──
+          # Only start a fresh chat session when the saved context is actually
+          # huge. Blindly resetting every run loses the conversation the user
+          # was in the middle of — that caused real data loss before.
+          python3 - <<'PYSESS'
+          import json, os, re, sqlite3
+          home = os.path.expanduser("~/.hermes")
+          sf = os.path.join(home, "sessions", "sessions.json")
+          db = os.path.join(home, "state.db")
+          try:
+              raw = open(sf).read()
+              ids = set(re.findall(r"\d{8}_\d{6}_[0-9a-f]+", raw))
+              worst = 0
+              if ids and os.path.exists(db):
+                  con = sqlite3.connect(db)
+                  for sid in ids:
+                      n = con.execute(
+                          "SELECT COALESCE(SUM(token_count),0) FROM messages WHERE session_id=?",
+                          (sid,),
+                      ).fetchone()[0]
+                      worst = max(worst, n or 0)
+                  con.close()
+              if worst > 45000:
+                  os.remove(sf)
+                  print("session context too big (%d tokens) - fresh session" % worst)
+              else:
+                  print("keeping sessions (max %d tokens)" % worst)
+          except Exception as e:
+              print("session check skipped:", e)
+          PYSESS
 
           # watchdog: if the LiteLLM router hangs (rate-limit deadlock etc.),
           # auto-restart it — no more force-stopping the whole Action run
