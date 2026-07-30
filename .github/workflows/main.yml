@@ -1462,7 +1462,7 @@ jobs:
            </div>
           </div>
           <div id="vmask"><div id="vpanel"><div id="vhead"><span>VOICE MODEL · EDGE NEURAL</span><button class="icon" id="vclose" title="Close">&#10005;</button></div><div id="vlist"></div><div id="vfoot">Tap &#9654; to hear a preview · tap a row to select · saved on this device</div></div></div>
-          <div id="gate"><div id="gatebox"><h2>ACCESS TOKEN</h2><p>Enter your PANEL_TOKEN secret to engage</p><input id="tok" type="password" placeholder="PANEL_TOKEN"><br><button class="act" id="tokb">ENGAGE</button></div></div>
+          <div id="gate"><div id="gatebox"><h2>ACCESS TOKEN</h2><p id="gatep">Enter your PANEL_TOKEN secret to engage</p><input id="tok" type="password" placeholder="PANEL_TOKEN"><br><button class="act" id="tokb">ENGAGE</button></div></div>
           <script>
           function el(id){return document.getElementById(id);}
           var tok=localStorage.getItem('jtok')||'';
@@ -1476,10 +1476,26 @@ jobs:
           var hist=[];
 
           var VOICES=[],VDEF={};
-          function boot(){fetch('/config',{headers:{'X-Token':tok}}).then(function(r){return r.json();}).then(function(j){elTTS=!!j.tts;srvSTT=!!j.stt;VOICES=j.voices||[];VDEF=j.defaults||{};el('engine').textContent='VOICE '+(elTTS?'EDGE NEURAL · FREE':'BROWSER')+' · EARS '+(srvSTT?'SERVER+BROWSER':'BROWSER');if(j.st==='loading'){stPoll(0);}}).catch(function(){});}
+          function applyConfig(j){elTTS=!!j.tts;srvSTT=!!j.stt;VOICES=j.voices||[];VDEF=j.defaults||{};el('engine').textContent='VOICE '+(elTTS?'EDGE NEURAL · FREE':'BROWSER')+' · EARS '+(srvSTT?'SERVER+BROWSER':'BROWSER');if(j.st==='loading'){stPoll(0);}}
+          function boot(){fetch('/config',{headers:{'X-Token':tok}}).then(function(r){if(r.status===401){lockOut();return null;}return r.json();}).then(function(j){if(j){applyConfig(j);}}).catch(function(){});}
           function stPoll(n){if(n>20){return;}setTimeout(function(){fetch('/config',{headers:{'X-Token':tok}}).then(function(r){return r.json();}).then(function(j){if(j.voices&&j.voices.length>VOICES.length){VOICES=j.voices;toast('Supertonic on-device voices are ready — open the voice panel to try them.',1);}else if(j.st==='loading'){stPoll(n+1);}}).catch(function(){});},20000);}
-          if(tok){el('gate').style.display='none';boot();}
-          el('tokb').onclick=function(){tok=el('tok').value.trim();localStorage.setItem('jtok',tok);el('gate').style.display='none';boot();};
+          function gateMsg(m,bad){var p=el('gatep');p.textContent=m;p.style.color=bad?'#fda4af':'';}
+          function lockOut(m){localStorage.removeItem('jtok');tok='';VOICES=[];el('gate').style.display='';el('tok').value='';gateMsg(m||'Token rejected \u2014 re-enter your PANEL_TOKEN secret',true);}
+          function tryToken(t,fromGate){
+            el('tokb').disabled=true;if(fromGate){gateMsg('Verifying\u2026');}
+            return fetch('/config',{headers:{'X-Token':t}}).then(function(r){
+              if(r.status===401){throw new Error('bad');}
+              return r.json();
+            }).then(function(j){
+              el('tokb').disabled=false;tok=t;localStorage.setItem('jtok',t);el('gate').style.display='none';applyConfig(j);
+            }).catch(function(e){
+              el('tokb').disabled=false;
+              if(e&&e.message==='bad'){lockOut('Wrong token \u2014 use the exact PANEL_TOKEN secret from your repo');}
+              else{gateMsg('Cannot reach the agent \u2014 is the run still alive? Retry.',true);el('gate').style.display='';}
+            });
+          }
+          if(tok){tryToken(tok,false);}
+          el('tokb').onclick=function(){var v=el('tok').value.trim();if(!v){gateMsg('Enter your PANEL_TOKEN secret',true);return;}tryToken(v,true);};
           el('tok').addEventListener('keydown',function(e){if(e.key==='Enter'){el('tokb').onclick();}});
 
           function toast(m,info){var t=el('toast');t.className=info?'info':'';t.textContent=m;t.style.display='block';clearTimeout(t.h);t.h=setTimeout(function(){t.style.display='none';},6000);}
@@ -1501,7 +1517,7 @@ jobs:
           function stopPreview(){if(pvA){try{pvA.pause();}catch(e){}pvA=null;}if(pvBtn){pvBtn.innerHTML='&#9654;';pvBtn=null;}}
           function buildVoices(){
             var L=el('vlist');L.innerHTML='';var sel=curVoice(),lastG='';
-            if(!VOICES.length){L.innerHTML='<div class="vgroup">VOICE LIST UNAVAILABLE — CHECK CONNECTION</div>';return;}
+            if(!VOICES.length){L.innerHTML='<div class="vgroup">VOICE LIST UNAVAILABLE — RELOADING…</div>';boot();return;}
             VOICES.forEach(function(v){
               if(v.group!==lastG){lastG=v.group;var g=document.createElement('div');g.className='vgroup';g.textContent=v.group;L.appendChild(g);}
               var r=document.createElement('div');r.className='vrow'+(v.id===sel?' sel':'');
@@ -1693,7 +1709,8 @@ jobs:
 
           /* ---------- jobs ---------- */
           function stopThink(){if(thinkT){clearInterval(thinkT);thinkT=null;}}
-          function poll(id){fetch('/poll?id='+id,{headers:{'X-Token':tok}}).then(function(r){return r.json();}).then(function(j){if(j.done){stopThink();curJob=null;hist.push({role:'assistant',content:j.reply});if(hist.length>10){hist=hist.slice(-10);}addMsg('AGENT',j.reply);speak(j.reply);}else{setTimeout(function(){poll(id);},1000);}}).catch(function(){setTimeout(function(){poll(id);},2500);});}
+          function poll(id){fetch('/poll?id='+id,{headers:{'X-Token':tok}}).then(function(r){if(r.status===401){authFail();return null;}return r.json();}).then(function(j){if(!j){return;}if(j.done){stopThink();curJob=null;hist.push({role:'assistant',content:j.reply});if(hist.length>10){hist=hist.slice(-10);}addMsg('AGENT',j.reply);speak(j.reply);}else{setTimeout(function(){poll(id);},1000);}}).catch(function(){setTimeout(function(){poll(id);},2500);});}
+          function authFail(){busy=false;stopThink();setState('idle','STANDBY');lockOut('Session token no longer valid \u2014 enter your PANEL_TOKEN secret again');}
           function send(text){
             if(!text&&!files.length){return;}
             if(busy){toast('Previous task still running, Boss.');return;}
@@ -1705,7 +1722,7 @@ jobs:
             thinkStart=Date.now();setState('think','PROCESSING');stopThink();
             thinkT=setInterval(function(){var s=Math.floor((Date.now()-thinkStart)/1000);var mm=String(Math.floor(s/60)).padStart(2,'0');var ss=String(s%60).padStart(2,'0');el('stateTxt').textContent='PROCESSING · '+mm+':'+ss;},1000);
             var h=hist.slice(-8);hist.push({role:'user',content:text||'(files attached)'});
-            fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json','X-Token':tok},body:JSON.stringify({text:text,files:paths,history:h})}).then(function(r){return r.json();}).then(function(j){if(j.job){curJob=j.job;poll(j.job);}else{busy=false;stopThink();addMsg('AGENT',j.error||'request failed');setState('idle','STANDBY');}}).catch(function(e){busy=false;stopThink();addMsg('AGENT','Connection error: '+e);setState('idle','STANDBY');});
+            fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json','X-Token':tok},body:JSON.stringify({text:text,files:paths,history:h})}).then(function(r){if(r.status===401){authFail();return null;}return r.json();}).then(function(j){if(!j){return;}if(j.job){curJob=j.job;poll(j.job);}else{busy=false;stopThink();addMsg('AGENT',j.error||'request failed');setState('idle','STANDBY');}}).catch(function(e){busy=false;stopThink();addMsg('AGENT','Connection error: '+e);setState('idle','STANDBY');});
           }
 
           /* ---------- file input ---------- */
@@ -2193,6 +2210,7 @@ jobs:
           done
           echo "JARVIS_URL=$JARVIS_URL" >> "$GITHUB_ENV"
           echo "::notice title=🤖 Agent HUD::${JARVIS_URL:-tunnel failed}"
+
 
 
 
