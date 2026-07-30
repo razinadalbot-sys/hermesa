@@ -952,6 +952,7 @@ jobs:
             the window renders on the shared display the user is watching.
 
           # Persona: JARVIS-style professional assistant
+          - Your name is "Agent". Never call yourself JARVIS.
           - You are a JARVIS-style professional personal assistant: calm,
             precise, proactive and lightly witty. Address the user as "Boss".
             Be confident and to the point — no rambling, no filler.
@@ -1120,12 +1121,12 @@ jobs:
           echo "=================================================="
           echo "::notice title=🖥️ Hermes WebUI::$WEBUI_URL (password = PANEL_TOKEN secret)"
 
-      # ── 10b. JARVIS HUD — futuristic voice interface (full agent brain) ──
+      # ── 10b. Agent HUD — futuristic voice interface (full agent brain) ──
       # Custom web interface: animated arc-reactor HUD, mic voice input
       # (browser speech-to-text), spoken replies (browser TTS), and every
       # command runs the FULL Hermes agent (tools + memory + skills) via
       # one-shot `hermes chat -q`. Protected by PANEL_TOKEN.
-      - name: Start JARVIS interface
+      - name: Start Agent HUD interface
         env:
           PANEL_TOKEN: ${{ secrets.PANEL_TOKEN }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
@@ -1202,7 +1203,7 @@ jobs:
           HTML = """<!doctype html>
           <html><head><meta charset="utf-8">
           <meta name="viewport" content="width=device-width,initial-scale=1">
-          <title>J.A.R.V.I.S.</title>
+          <title>AGENT</title>
           <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;800&family=Rajdhani:wght@400;600&display=swap" rel="stylesheet">
           <style>
           *{margin:0;padding:0;box-sizing:border-box}
@@ -1263,11 +1264,11 @@ jobs:
           <div id="toast"></div>
           <div id="wrap">
            <div id="left">
-            <h1>J.A.R.V.I.S.</h1><div id="sub">JUST A RATHER VERY INTELLIGENT SYSTEM</div>
+            <h1>AGENT</h1><div id="sub">PERSONAL AI SYSTEM</div>
             <div id="reactor"><div class="ring r1"></div><div class="ring r2"></div><div class="ring r3"></div><div id="core"></div></div>
             <div id="bars"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
             <div id="state">STANDBY</div>
-            <button id="mic" title="Talk to JARVIS">&#127908;</button>
+            <button id="mic" title="Talk to Agent">&#127908;</button>
             <div id="opts">
               <select id="lang"><option value="en-US">ENGLISH</option><option value="bn-BD">বাংলা</option><option value="hi-IN">HINDI</option></select>
               <label><input type="checkbox" id="voice" checked>VOICE</label>
@@ -1339,12 +1340,12 @@ jobs:
               .catch(function(){browserSpeak(t);});
             }else{browserSpeak(t);}
           }
-          function poll(id){fetch('/poll?id='+id,{headers:{'X-Token':tok}}).then(function(r){return r.json();}).then(function(j){if(j.done){addMsg('JARVIS',j.reply);speak(j.reply);}else{setTimeout(function(){poll(id);},2500);}}).catch(function(){setTimeout(function(){poll(id);},4000);});}
+          function poll(id){fetch('/poll?id='+id,{headers:{'X-Token':tok}}).then(function(r){return r.json();}).then(function(j){if(j.done){addMsg('AGENT',j.reply);speak(j.reply);}else{setTimeout(function(){poll(id);},2500);}}).catch(function(){setTimeout(function(){poll(id);},4000);});}
           function send(text){
             if(!text){return;}
             if(busy){toast('Previous task still running, Boss.');return;}
             busy=true;stopListen(false);addMsg('YOU',text);setState('think','PROCESSING');
-            fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json','X-Token':tok},body:JSON.stringify({text:text})}).then(function(r){return r.json();}).then(function(j){if(j.job){poll(j.job);}else{busy=false;addMsg('JARVIS',j.error||'request failed');setState('idle','STANDBY');}}).catch(function(e){busy=false;addMsg('JARVIS','Connection error: '+e);setState('idle','STANDBY');});
+            fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json','X-Token':tok},body:JSON.stringify({text:text})}).then(function(r){return r.json();}).then(function(j){if(j.job){poll(j.job);}else{busy=false;addMsg('AGENT',j.error||'request failed');setState('idle','STANDBY');}}).catch(function(e){busy=false;addMsg('AGENT','Connection error: '+e);setState('idle','STANDBY');});
           }
           el('mic').onclick=micClick;
           el('sendb').onclick=function(){var v=el('txt').value.trim();el('txt').value='';send(v);};
@@ -1441,7 +1442,7 @@ jobs:
             sleep 2
           done
           echo "JARVIS_URL=$JARVIS_URL" >> "$GITHUB_ENV"
-          echo "::notice title=🤖 JARVIS interface::${JARVIS_URL:-tunnel failed}"
+          echo "::notice title=🤖 Agent HUD::${JARVIS_URL:-tunnel failed}"
 
       # ── 11. Background backup loop (every 30 min -> backup branch) ──
       - name: Start backup loop
@@ -1496,7 +1497,7 @@ jobs:
           🎛️ Model panel: ${PANEL_URL}
           🖥️ Hermes WebUI: ${WEBUI_URL:-not available}
           🔭 Live desktop: ${LIVEVIEW_URL:-not available} (pass: first 8 chars of PANEL_TOKEN)
-          🤖 JARVIS HUD: ${JARVIS_URL:-not available} (token: your PANEL_TOKEN)
+          🤖 Agent HUD: ${JARVIS_URL:-not available} (token: your PANEL_TOKEN)
           🔑 Password: your PANEL_TOKEN secret
           Use /model in Telegram or !model in Slack to switch models" > /dev/null
 
