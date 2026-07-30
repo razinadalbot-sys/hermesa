@@ -1164,7 +1164,7 @@ jobs:
           cat > /tmp/jarvis/index.html <<'HUDHTML'
           <!doctype html>
           <html><head><meta charset="utf-8">
-          <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,interactive-widget=resizes-content">
+          <meta name="viewport" content="width=device-width,initial-scale=1">
           <title>AGENT HUD</title>
           <link rel="preconnect" href="https://fonts.googleapis.com">
           <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -1178,8 +1178,7 @@ jobs:
             --amber:#fbbf24;--amber-soft:rgba(251,191,36,.12);
             --red:#f87171;--red-soft:rgba(248,113,113,.12);
           }
-          *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-          button,select,input,.vrow{touch-action:manipulation}
+          *{margin:0;padding:0;box-sizing:border-box}
           html,body{height:100%}
           body{background:var(--bg);color:var(--text);font-family:Inter,system-ui,sans-serif;min-height:100dvh;overflow:hidden;font-size:15px;line-height:1.5}
           body:before{content:"";position:fixed;inset:0;z-index:0;pointer-events:none;
@@ -1262,7 +1261,7 @@ jobs:
           #top .tl{display:flex;align-items:center;gap:10px;font-family:"JetBrains Mono",monospace;font-size:11px;letter-spacing:.24em;color:var(--dim);text-transform:uppercase}
           #top .tl i{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 8px var(--green)}
           #clock{font-family:"JetBrains Mono",monospace;font-size:11px;color:var(--faint);letter-spacing:.14em}
-          #log{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px;backdrop-filter:blur(10px);scroll-behavior:smooth}
+          #log{flex:1;min-height:0;overflow-y:auto;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px;backdrop-filter:blur(10px);scroll-behavior:smooth}
           #log::-webkit-scrollbar{width:8px}#log::-webkit-scrollbar-thumb{background:#1e2f44;border-radius:8px}
           #empty{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;color:var(--faint);text-align:center}
           #empty .t{font-family:Orbitron,monospace;letter-spacing:.3em;font-size:13px;color:#3f5b75}
@@ -1333,55 +1332,7 @@ jobs:
           .vrow .vm{font-size:11px;color:var(--faint);letter-spacing:.06em;margin-top:2px}
           .vrow .prev{margin-left:auto}
           #vfoot{padding:11px 18px;border-top:1px solid var(--line);font-size:11px;color:var(--faint);letter-spacing:.08em}
-          /* ---------- MOBILE ---------- */
-          @media(max-width:919px){
-            #wrap{padding:8px;gap:8px;padding-left:max(8px,env(safe-area-inset-left));padding-right:max(8px,env(safe-area-inset-right));padding-bottom:max(8px,env(safe-area-inset-bottom))}
-            /* compact console: brand strip, then reactor + state + mic in one row */
-            #left{flex-direction:row;flex-wrap:wrap;justify-content:center;align-items:center;gap:6px 14px;padding:10px 12px 12px}
-            #brand{width:100%}
-            h1{font-size:19px;letter-spacing:.34em;padding-left:.34em}
-            #sub{font-size:8.5px;letter-spacing:.26em;margin-top:3px}
-            #reactor{width:clamp(84px,24vw,110px);margin:0}
-            #state{font-size:9.5px;letter-spacing:.2em;padding:7px 13px}
-            #mic{width:58px}
-            #bars{display:none}#top{display:none}#engine{display:none}
-            #interrupt{padding:10px 16px;min-height:44px}
-            /* options: full-width row with comfortable touch sizes */
-            #opts{width:100%;gap:10px 14px}
-            select{padding:10px 12px;font-size:14px;min-height:42px}
-            .tog{font-size:10px;min-height:42px}
-            .tog input{width:36px;height:20px}
-            .tog input:before{width:14px;height:14px}
-            .tog input:checked:before{left:19px}
-            #vmb{padding:11px 14px;min-height:42px}
-            /* conversation: denser padding, wider bubbles, readable text */
-            #log{padding:12px;border-radius:12px}
-            .msg{max-width:94%;margin-bottom:13px}
-            .msg pre{font-size:14px}
-            #empty .d{max-width:260px}
-            #live{font-size:13px;min-height:18px}
-            /* composer: 16px input stops iOS zoom-on-focus; 46px touch targets */
-            #inrow{gap:7px}
-            #txt{font-size:16px;padding:12px 13px}
-            button.act{min-height:46px;padding:0 15px}
-            #attach{min-width:46px;font-size:17px}
-            .icon{width:44px;height:44px;font-size:15px}
-            .chip{padding:7px 11px;font-size:11.5px}
-            .chip button{font-size:16px;padding:2px 5px}
-            /* playback bar: drop the label, keep track + big controls */
-            #pbar{gap:8px;padding:8px 10px}
-            #pbar .lbl{display:none}
-            /* voice model panel becomes a bottom sheet */
-            #vmask{align-items:flex-end}
-            #vpanel{width:100%;max-width:none;max-height:80dvh;border-radius:18px 18px 0 0;border-bottom:none}
-            #vhead{padding:14px 16px}
-            .vrow{padding:12px;gap:10px}
-            .vrow .prev{width:44px;height:44px}
-            #vfoot{padding:11px 16px;padding-bottom:max(11px,env(safe-area-inset-bottom))}
-            /* token gate fits small screens */
-            #gatebox{margin:0 16px;padding:26px 22px;width:100%;max-width:360px}
-            #gatebox input,#gatebox button{width:100%}
-          }
+          @media(max-width:919px){#left{flex-direction:row;flex-wrap:wrap;justify-content:center;gap:10px;padding:12px}#reactor{width:clamp(95px,20vmin,130px);margin:0}#brand{width:100%}#bars{display:none}#top{display:none}}
           </style></head>
           <body class="idle">
           <div id="grid"></div>
@@ -1534,35 +1485,20 @@ jobs:
             var chunks=[];recSpoke=false;
             try{mrec=new MediaRecorder(stream);}catch(e){toast('Audio recording not supported in this browser.');return;}
             mrec.ondataavailable=function(e){chunks.push(e.data);};
-            mrec.onstop=function(){stopVad();el('live').textContent='';var b=new Blob(chunks,{type:mrec.mimeType||'audio/webm'});
-              /* send when voice was detected OR the clip is big enough that the meter
-                 may simply have missed it — let Whisper decide, never discard words */
-              if((recSpoke&&b.size>2000)||b.size>12000){sendSTT(b);}
-              else{setState('idle','STANDBY');if(el('auto').checked&&!busy){setTimeout(startRec,400);}}};
+            mrec.onstop=function(){stopVad();var b=new Blob(chunks,{type:mrec.mimeType||'audio/webm'});if(recSpoke&&b.size>2000){sendSTT(b);}else{setState('idle','STANDBY');if(el('auto').checked&&!busy){setTimeout(startRec,400);}}};
             mrec.start();listening=true;el('mic').classList.add('on');setState('listen','LISTENING — SPEAK');
             t0=Date.now();
             try{
               actx=new (window.AudioContext||window.webkitAudioContext)();
-              if(actx.state==='suspended'){actx.resume();}
               var src=actx.createMediaStreamSource(stream),an=actx.createAnalyser();an.fftSize=512;src.connect(an);
-              var data=new Uint8Array(an.fftSize),quiet=0,nf=0,ticks=0,flat=0;
+              var data=new Uint8Array(an.fftSize),quiet=0;
               vadT=setInterval(function(){
                 an.getByteTimeDomainData(data);
                 var m=0;for(var i=0;i<data.length;i++){var v=Math.abs(data[i]-128);if(v>m){m=v;}}
-                ticks++;
-                if(ticks<=4){nf=Math.max(nf,m);return;} /* first 400ms: learn the room's noise floor */
-                if(m===0){flat+=100;}else{flat=0;}
-                if(flat>=2000){ /* analyser returns silence (privacy shields) -> timed mode */
-                  clearInterval(vadT);vadT=null;recSpoke=true;
-                  el('live').textContent='● voice meter blocked by browser shields — recording 8s then sending';
-                  setTimeout(function(){if(mrec&&mrec.state==='recording'){stopListen(false);}},Math.max(300,8000-(Date.now()-t0)));
-                  return;}
-                var th=Math.max(6,Math.min(20,nf*1.8+3)); /* adaptive: just above the noise floor */
-                if(m>th){if(!recSpoke){el('live').textContent='● hearing you — pause when done and I will send';}recSpoke=true;quiet=0;}
-                else if(recSpoke){quiet+=100;}
-                if((recSpoke&&quiet>=1500)||Date.now()-t0>25000){stopListen(false);}
+                if(m>10){recSpoke=true;quiet=0;}else if(recSpoke){quiet+=100;}
+                if((recSpoke&&quiet>=1400)||Date.now()-t0>25000){stopListen(false);}
               },100);
-            }catch(e){recSpoke=true;setTimeout(function(){if(mrec&&mrec.state==='recording'){stopListen(false);}},8000);}
+            }catch(e){recSpoke=true;}
           }
           function stopListen(user){
             clearTimeout(srT);
@@ -1570,7 +1506,7 @@ jobs:
             if(mrec&&mrec.state==='recording'){if(user){recSpoke=true;}micOff();mrec.stop();return;}
             if(user){setState('idle','STANDBY');}
           }
-          function sendSTT(b){setState('think','TRANSCRIBING');fetch('/stt?lang='+el('lang').value,{method:'POST',headers:{'X-Token':tok,'Content-Type':b.type||'audio/webm'},body:b}).then(function(r){return r.json();}).then(function(j){if(j.text){send(j.text);}else if(j.error){toast(j.error);setState('idle','STANDBY');}else{toast('I heard audio but no clear words — speak a little closer, Boss.',1);setState('idle','STANDBY');if(el('auto').checked&&!busy){setTimeout(startRec,500);}}}).catch(function(){toast('Transcription request failed');setState('idle','STANDBY');});}
+          function sendSTT(b){setState('think','TRANSCRIBING');fetch('/stt?lang='+el('lang').value,{method:'POST',headers:{'X-Token':tok,'Content-Type':b.type||'audio/webm'},body:b}).then(function(r){return r.json();}).then(function(j){if(j.text){send(j.text);}else{toast(j.error||'Transcription failed');setState('idle','STANDBY');}}).catch(function(){toast('Transcription request failed');setState('idle','STANDBY');});}
 
           /* ---------- barge-in: speak to interrupt agent voice ---------- */
           function stopBarge(){if(bargeT){clearInterval(bargeT);bargeT=null;}}
@@ -1814,7 +1750,9 @@ jobs:
                                   data={"model": "whisper-large-v3", "language": short},
                                   timeout=90)
                       if r.status_code == 200:
-                          return (r.json().get("text") or "").strip()
+                          t = (r.json().get("text") or "").strip()
+                          if t:
+                              return t
                   except Exception:
                       pass
               for k in el_keys():
@@ -1825,7 +1763,9 @@ jobs:
                                   data={"model_id": "scribe_v1"},
                                   timeout=90)
                       if r.status_code == 200:
-                          return (r.json().get("text") or "").strip()
+                          t = (r.json().get("text") or "").strip()
+                          if t:
+                              return t
                   except Exception:
                       pass
               return None
@@ -1976,9 +1916,9 @@ jobs:
                   return jsonify(error="no audio received"), 400
               text = do_stt(blob, request.headers.get("Content-Type", "audio/webm"),
                             request.args.get("lang", "en-US"))
-              if text is None:
-                  return jsonify(error="transcription unavailable (add GROQ_API_KEY or ELEVENLABS_KEYS)"), 503
-              return jsonify(text=text)
+              if text:
+                  return jsonify(text=text)
+              return jsonify(error="transcription unavailable (add GROQ_API_KEY or ELEVENLABS_KEYS)"), 503
 
           @app.route("/upload", methods=["POST"])
           def upload():
@@ -2070,8 +2010,6 @@ jobs:
           done
           echo "JARVIS_URL=$JARVIS_URL" >> "$GITHUB_ENV"
           echo "::notice title=🤖 Agent HUD::${JARVIS_URL:-tunnel failed}"
-
-
 
 
 
