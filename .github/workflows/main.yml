@@ -1305,16 +1305,31 @@ jobs:
             <input type="file" id="fpick" multiple style="display:none">
            </div>
           </div>
-          <div id="gate"><div id="gatebox"><h2>ACCESS TOKEN</h2><input id="tok" type="password" placeholder="PANEL_TOKEN"><br><button id="tokb">ENGAGE</button></div></div>
+          <div id="gate"><div id="gatebox"><h2>ACCESS TOKEN</h2><input id="tok" type="password" placeholder="PANEL_TOKEN"><br><div id="gerr" style="color:#ff8fa3;font-size:12px;min-height:17px;margin-bottom:6px"></div><button id="tokb" type="button"><i class="fa-solid fa-unlock"></i> ENGAGE</button></div></div>
           <script>
           function el(id){return document.getElementById(id);}
-          var tok=localStorage.getItem('jtok')||'';
+          window.onerror=function(m){try{var g=document.getElementById('gerr');if(g){g.textContent='Script error: '+m;}}catch(e){}};
+          function lsGet(k){try{return localStorage.getItem(k)||'';}catch(e){return '';}}
+          function lsSet(k,v){try{localStorage.setItem(k,v);}catch(e){}}
+          var tok=lsGet('jtok');
           var elTTS=false,srvSTT=false,SRbroken=false,busy=false;
           var SR=window.SpeechRecognition||window.webkitSpeechRecognition;
           var rec=null,mrec=null,stream=null,listening=false,curA=null,curU=null,vadT=null,actx=null,t0=0,recSpoke=false;
-          function boot(){fetch('/config',{headers:{'X-Token':tok}}).then(function(r){return r.json();}).then(function(j){elTTS=!!j.tts;srvSTT=!!j.stt;el('engine').textContent='VOICE: '+(elTTS?'EDGE NEURAL':'BROWSER')+' · EARS: '+(srvSTT?'SERVER + BROWSER':'BROWSER ONLY');}).catch(function(){});}
+          function boot(){fetch('/config',{headers:{'X-Token':tok}}).then(function(r){if(r.status===401){lsSet('jtok','');tok='';el('gate').style.display='flex';el('gerr').textContent='Saved token was rejected — enter your PANEL_TOKEN again.';return null;}return r.json();}).then(function(j){if(!j){return;}elTTS=!!j.tts;srvSTT=!!j.stt;el('engine').textContent='VOICE: '+(elTTS?'EDGE NEURAL':'BROWSER')+' · EARS: '+(srvSTT?'SERVER + BROWSER':'BROWSER ONLY');}).catch(function(){});}
           if(tok){el('gate').style.display='none';boot();}
-          el('tokb').onclick=function(){tok=el('tok').value.trim();localStorage.setItem('jtok',tok);el('gate').style.display='none';boot();};
+          function gateTry(){
+            var v=el('tok').value.trim();
+            if(!v){el('gerr').textContent='Enter your PANEL_TOKEN secret.';return;}
+            el('gerr').textContent='Verifying...';el('tokb').disabled=true;
+            fetch('/config',{headers:{'X-Token':v}}).then(function(r){
+              el('tokb').disabled=false;
+              if(r.status===401){el('gerr').textContent='Wrong token — use the full PANEL_TOKEN secret (no spaces).';return;}
+              if(!r.ok){el('gerr').textContent='Server error '+r.status+' — try again.';return;}
+              tok=v;lsSet('jtok',tok);el('gerr').textContent='';el('gate').style.display='none';boot();
+            }).catch(function(){el('tokb').disabled=false;el('gerr').textContent='Cannot reach the Agent server — open the newest HUD link from Telegram.';});
+          }
+          el('tokb').addEventListener('click',gateTry);
+          el('tok').addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();gateTry();}});
           function toast(m){var t=el('toast');t.textContent=m;t.style.display='block';clearTimeout(t.h);t.h=setTimeout(function(){t.style.display='none';},6000);}
           function setState(s,l){document.body.className=s;el('state').textContent=l;}
           function addMsg(who,text){var d=document.createElement('div');d.className='msg '+who;var b=document.createElement('b');b.textContent=who;var p=document.createElement('pre');p.textContent=text;d.appendChild(b);d.appendChild(p);el('log').appendChild(d);el('log').scrollTop=el('log').scrollHeight;}
@@ -1399,10 +1414,12 @@ jobs:
           el('sendb').onclick=function(){var v=el('txt').value.trim();el('txt').value='';send(v);};
           el('txt').addEventListener('keydown',function(e){if(e.key==='Enter'){el('sendb').onclick();}});
           if(window.speechSynthesis){speechSynthesis.getVoices();speechSynthesis.onvoiceschanged=function(){};}
+          try{
           var c=el('stars'),x=c.getContext('2d');
           function rs(){c.width=innerWidth;c.height=innerHeight;}rs();addEventListener('resize',rs);
           var pts=[];for(var i=0;i<120;i++){pts.push({x:Math.random(),y:Math.random(),z:Math.random()*1.5+0.3,s:Math.random()*0.0006+0.0002});}
           (function anim(){x.clearRect(0,0,c.width,c.height);for(var i=0;i<pts.length;i++){var p=pts[i];p.y-=p.s;if(p.y<0){p.y=1;p.x=Math.random();}x.globalAlpha=0.5*p.z;x.fillStyle='#37c8ff';x.fillRect(p.x*c.width,p.y*c.height,p.z,p.z*3);}x.globalAlpha=1;requestAnimationFrame(anim);})();
+          }catch(e){}
           </script>
           </body></html>"""
 
