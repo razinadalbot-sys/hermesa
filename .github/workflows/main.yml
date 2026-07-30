@@ -57,6 +57,20 @@ jobs:
             done
           fi
 
+          # ── Put restored OUTSIDE-tree Hermes state back in place ──
+          # The backup loop mirrors ~/.config/hermes*, ~/.local/share/hermes*
+          # and ~/.local/state/hermes* into ~/.hermes/xdg-mirror/. Restore them
+          # to their real homes so skills/brain/config are live again.
+          for pair in "config:.config" "share:.local/share" "state:.local/state"; do
+            srcd="$HERMES_HOME/xdg-mirror/${pair%%:*}"
+            dstd="$HOME/${pair##*:}"
+            if [ -d "$srcd" ] && [ -n "$(ls -A "$srcd" 2>/dev/null)" ]; then
+              mkdir -p "$dstd"
+              rsync -a "$srcd/" "$dstd/"
+              echo "Restored $dstd from backup"
+            fi
+          done
+
       # ── 1b. Preinstalled environment cache ──
       # The runner VM is WIPED after every run, so nothing can be truly
       # "pre-installed". This cache is the next best thing: a snapshot of
@@ -78,11 +92,31 @@ jobs:
       # ── 2. Install Hermes Agent (skipped when restored from cache) ──
       - name: Install Hermes Agent
         run: |
+          # Stash any user state sitting in the agent dir BEFORE wiping it
+          # (belt-and-braces: normally agent-state/ already holds a copy).
+          KEEP=/tmp/hermes-keep; rm -rf "$KEEP"; mkdir -p "$KEEP"
+          if [ -d "$HERMES_HOME/hermes-agent" ]; then
+            for d in skills skill brain brains memory memories tasks task knowledge notes sessions session prompts plugins tools agents config configs data db; do
+              [ -e "$HERMES_HOME/hermes-agent/$d" ] && cp -a "$HERMES_HOME/hermes-agent/$d" "$KEEP/" || true
+            done
+          fi
           rm -rf "$HERMES_HOME/hermes-agent"
           if [ -x "$HOME/.local/bin/hermes" ]; then
             echo "Hermes restored from cache — skipping download/install"
           else
             curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+          fi
+          # ── MERGE BACKED-UP USER STATE into the fresh agent dir ──
+          # skills / brain / tasks / memory added in earlier sessions come back
+          # from ~/.hermes/agent-state (pulled from the privatestorage repo).
+          if [ -d "$HERMES_HOME/agent-state" ] && [ -n "$(ls -A "$HERMES_HOME/agent-state" 2>/dev/null)" ]; then
+            mkdir -p "$HERMES_HOME/hermes-agent"
+            rsync -a "$HERMES_HOME/agent-state/" "$HERMES_HOME/hermes-agent/"
+            echo "Restored agent state: $(ls "$HERMES_HOME/agent-state" | tr '\n' ' ')"
+          fi
+          if [ -n "$(ls -A "$KEEP" 2>/dev/null)" ]; then
+            mkdir -p "$HERMES_HOME/hermes-agent"
+            rsync -a "$KEEP/" "$HERMES_HOME/hermes-agent/"
           fi
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
@@ -1164,7 +1198,7 @@ jobs:
           cat > /tmp/jarvis/index.html <<'HUDHTML'
           <!doctype html>
           <html><head><meta charset="utf-8">
-          <meta name="viewport" content="width=device-width,initial-scale=1">
+          <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,interactive-widget=resizes-content">
           <title>AGENT HUD</title>
           <link rel="preconnect" href="https://fonts.googleapis.com">
           <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -1178,7 +1212,8 @@ jobs:
             --amber:#fbbf24;--amber-soft:rgba(251,191,36,.12);
             --red:#f87171;--red-soft:rgba(248,113,113,.12);
           }
-          *{margin:0;padding:0;box-sizing:border-box}
+          *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+          button,select,input,.vrow{touch-action:manipulation}
           html,body{height:100%}
           body{background:var(--bg);color:var(--text);font-family:Inter,system-ui,sans-serif;min-height:100dvh;overflow:hidden;font-size:15px;line-height:1.5}
           body:before{content:"";position:fixed;inset:0;z-index:0;pointer-events:none;
@@ -1261,7 +1296,7 @@ jobs:
           #top .tl{display:flex;align-items:center;gap:10px;font-family:"JetBrains Mono",monospace;font-size:11px;letter-spacing:.24em;color:var(--dim);text-transform:uppercase}
           #top .tl i{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 8px var(--green)}
           #clock{font-family:"JetBrains Mono",monospace;font-size:11px;color:var(--faint);letter-spacing:.14em}
-          #log{flex:1;min-height:0;overflow-y:auto;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px;backdrop-filter:blur(10px);scroll-behavior:smooth}
+          #log{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px;backdrop-filter:blur(10px);scroll-behavior:smooth}
           #log::-webkit-scrollbar{width:8px}#log::-webkit-scrollbar-thumb{background:#1e2f44;border-radius:8px}
           #empty{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;color:var(--faint);text-align:center}
           #empty .t{font-family:Orbitron,monospace;letter-spacing:.3em;font-size:13px;color:#3f5b75}
@@ -1332,7 +1367,55 @@ jobs:
           .vrow .vm{font-size:11px;color:var(--faint);letter-spacing:.06em;margin-top:2px}
           .vrow .prev{margin-left:auto}
           #vfoot{padding:11px 18px;border-top:1px solid var(--line);font-size:11px;color:var(--faint);letter-spacing:.08em}
-          @media(max-width:919px){#left{flex-direction:row;flex-wrap:wrap;justify-content:center;gap:10px;padding:12px}#reactor{width:clamp(95px,20vmin,130px);margin:0}#brand{width:100%}#bars{display:none}#top{display:none}}
+          /* ---------- MOBILE ---------- */
+          @media(max-width:919px){
+            #wrap{padding:8px;gap:8px;padding-left:max(8px,env(safe-area-inset-left));padding-right:max(8px,env(safe-area-inset-right));padding-bottom:max(8px,env(safe-area-inset-bottom))}
+            /* compact console: brand strip, then reactor + state + mic in one row */
+            #left{flex-direction:row;flex-wrap:wrap;justify-content:center;align-items:center;gap:6px 14px;padding:10px 12px 12px}
+            #brand{width:100%}
+            h1{font-size:19px;letter-spacing:.34em;padding-left:.34em}
+            #sub{font-size:8.5px;letter-spacing:.26em;margin-top:3px}
+            #reactor{width:clamp(84px,24vw,110px);margin:0}
+            #state{font-size:9.5px;letter-spacing:.2em;padding:7px 13px}
+            #mic{width:58px}
+            #bars{display:none}#top{display:none}#engine{display:none}
+            #interrupt{padding:10px 16px;min-height:44px}
+            /* options: full-width row with comfortable touch sizes */
+            #opts{width:100%;gap:10px 14px}
+            select{padding:10px 12px;font-size:14px;min-height:42px}
+            .tog{font-size:10px;min-height:42px}
+            .tog input{width:36px;height:20px}
+            .tog input:before{width:14px;height:14px}
+            .tog input:checked:before{left:19px}
+            #vmb{padding:11px 14px;min-height:42px}
+            /* conversation: denser padding, wider bubbles, readable text */
+            #log{padding:12px;border-radius:12px}
+            .msg{max-width:94%;margin-bottom:13px}
+            .msg pre{font-size:14px}
+            #empty .d{max-width:260px}
+            #live{font-size:13px;min-height:18px}
+            /* composer: 16px input stops iOS zoom-on-focus; 46px touch targets */
+            #inrow{gap:7px}
+            #txt{font-size:16px;padding:12px 13px}
+            button.act{min-height:46px;padding:0 15px}
+            #attach{min-width:46px;font-size:17px}
+            .icon{width:44px;height:44px;font-size:15px}
+            .chip{padding:7px 11px;font-size:11.5px}
+            .chip button{font-size:16px;padding:2px 5px}
+            /* playback bar: drop the label, keep track + big controls */
+            #pbar{gap:8px;padding:8px 10px}
+            #pbar .lbl{display:none}
+            /* voice model panel becomes a bottom sheet */
+            #vmask{align-items:flex-end}
+            #vpanel{width:100%;max-width:none;max-height:80dvh;border-radius:18px 18px 0 0;border-bottom:none}
+            #vhead{padding:14px 16px}
+            .vrow{padding:12px;gap:10px}
+            .vrow .prev{width:44px;height:44px}
+            #vfoot{padding:11px 16px;padding-bottom:max(11px,env(safe-area-inset-bottom))}
+            /* token gate fits small screens */
+            #gatebox{margin:0 16px;padding:26px 22px;width:100%;max-width:360px}
+            #gatebox input,#gatebox button{width:100%}
+          }
           </style></head>
           <body class="idle">
           <div id="grid"></div>
@@ -1393,7 +1476,8 @@ jobs:
           var hist=[];
 
           var VOICES=[],VDEF={};
-          function boot(){fetch('/config',{headers:{'X-Token':tok}}).then(function(r){return r.json();}).then(function(j){elTTS=!!j.tts;srvSTT=!!j.stt;VOICES=j.voices||[];VDEF=j.defaults||{};el('engine').textContent='VOICE '+(elTTS?'EDGE NEURAL · FREE':'BROWSER')+' · EARS '+(srvSTT?'SERVER+BROWSER':'BROWSER');}).catch(function(){});}
+          function boot(){fetch('/config',{headers:{'X-Token':tok}}).then(function(r){return r.json();}).then(function(j){elTTS=!!j.tts;srvSTT=!!j.stt;VOICES=j.voices||[];VDEF=j.defaults||{};el('engine').textContent='VOICE '+(elTTS?'EDGE NEURAL · FREE':'BROWSER')+' · EARS '+(srvSTT?'SERVER+BROWSER':'BROWSER');if(j.st==='loading'){stPoll(0);}}).catch(function(){});}
+          function stPoll(n){if(n>20){return;}setTimeout(function(){fetch('/config',{headers:{'X-Token':tok}}).then(function(r){return r.json();}).then(function(j){if(j.voices&&j.voices.length>VOICES.length){VOICES=j.voices;toast('Supertonic on-device voices are ready — open the voice panel to try them.',1);}else if(j.st==='loading'){stPoll(n+1);}}).catch(function(){});},20000);}
           if(tok){el('gate').style.display='none';boot();}
           el('tokb').onclick=function(){tok=el('tok').value.trim();localStorage.setItem('jtok',tok);el('gate').style.display='none';boot();};
           el('tok').addEventListener('keydown',function(e){if(e.key==='Enter'){el('tokb').onclick();}});
@@ -1485,20 +1569,35 @@ jobs:
             var chunks=[];recSpoke=false;
             try{mrec=new MediaRecorder(stream);}catch(e){toast('Audio recording not supported in this browser.');return;}
             mrec.ondataavailable=function(e){chunks.push(e.data);};
-            mrec.onstop=function(){stopVad();var b=new Blob(chunks,{type:mrec.mimeType||'audio/webm'});if(recSpoke&&b.size>2000){sendSTT(b);}else{setState('idle','STANDBY');if(el('auto').checked&&!busy){setTimeout(startRec,400);}}};
+            mrec.onstop=function(){stopVad();el('live').textContent='';var b=new Blob(chunks,{type:mrec.mimeType||'audio/webm'});
+              /* send when voice was detected OR the clip is big enough that the meter
+                 may simply have missed it — let Whisper decide, never discard words */
+              if((recSpoke&&b.size>2000)||b.size>12000){sendSTT(b);}
+              else{setState('idle','STANDBY');if(el('auto').checked&&!busy){setTimeout(startRec,150);}}};
             mrec.start();listening=true;el('mic').classList.add('on');setState('listen','LISTENING — SPEAK');
             t0=Date.now();
             try{
               actx=new (window.AudioContext||window.webkitAudioContext)();
+              if(actx.state==='suspended'){actx.resume();}
               var src=actx.createMediaStreamSource(stream),an=actx.createAnalyser();an.fftSize=512;src.connect(an);
-              var data=new Uint8Array(an.fftSize),quiet=0;
+              var data=new Uint8Array(an.fftSize),quiet=0,nf=0,ticks=0,flat=0;
               vadT=setInterval(function(){
                 an.getByteTimeDomainData(data);
                 var m=0;for(var i=0;i<data.length;i++){var v=Math.abs(data[i]-128);if(v>m){m=v;}}
-                if(m>10){recSpoke=true;quiet=0;}else if(recSpoke){quiet+=100;}
-                if((recSpoke&&quiet>=1400)||Date.now()-t0>25000){stopListen(false);}
+                ticks++;
+                if(ticks<=4){nf=Math.max(nf,m);return;} /* first 400ms: learn the room's noise floor */
+                if(m===0){flat+=100;}else{flat=0;}
+                if(flat>=2000){ /* analyser returns silence (privacy shields) -> timed mode */
+                  clearInterval(vadT);vadT=null;recSpoke=true;
+                  el('live').textContent='● voice meter blocked by browser shields — recording 15s then sending';
+                  setTimeout(function(){if(mrec&&mrec.state==='recording'){stopListen(false);}},Math.max(300,15000-(Date.now()-t0)));
+                  return;}
+                var th=Math.max(6,Math.min(20,nf*1.8+3)); /* adaptive: just above the noise floor */
+                if(m>th){if(!recSpoke||quiet>=1200){el('live').textContent='● hearing you — pause when done and I will send';}recSpoke=true;quiet=0;}
+                else if(recSpoke){quiet+=100;if(quiet===1200){el('live').textContent='● finishing… keep talking to add more';}}
+                if((recSpoke&&quiet>=2200)||Date.now()-t0>60000){stopListen(false);}
               },100);
-            }catch(e){recSpoke=true;}
+            }catch(e){recSpoke=true;setTimeout(function(){if(mrec&&mrec.state==='recording'){stopListen(false);}},15000);}
           }
           function stopListen(user){
             clearTimeout(srT);
@@ -1506,7 +1605,7 @@ jobs:
             if(mrec&&mrec.state==='recording'){if(user){recSpoke=true;}micOff();mrec.stop();return;}
             if(user){setState('idle','STANDBY');}
           }
-          function sendSTT(b){setState('think','TRANSCRIBING');fetch('/stt?lang='+el('lang').value,{method:'POST',headers:{'X-Token':tok,'Content-Type':b.type||'audio/webm'},body:b}).then(function(r){return r.json();}).then(function(j){if(j.text){send(j.text);}else{toast(j.error||'Transcription failed');setState('idle','STANDBY');}}).catch(function(){toast('Transcription request failed');setState('idle','STANDBY');});}
+          function sendSTT(b){setState('think','TRANSCRIBING');fetch('/stt?lang='+el('lang').value,{method:'POST',headers:{'X-Token':tok,'Content-Type':b.type||'audio/webm'},body:b}).then(function(r){return r.json();}).then(function(j){if(j.text){send(j.text);}else if(j.error){toast(j.error);setState('idle','STANDBY');}else{toast('I heard audio but no clear words — speak a little closer, Boss.',1);setState('idle','STANDBY');if(el('auto').checked&&!busy){setTimeout(startRec,500);}}}).catch(function(){toast('Transcription request failed');setState('idle','STANDBY');});}
 
           /* ---------- barge-in: speak to interrupt agent voice ---------- */
           function stopBarge(){if(bargeT){clearInterval(bargeT);bargeT=null;}}
@@ -1537,7 +1636,9 @@ jobs:
           function pbIcon(){el('pbPause').innerHTML=paused?'&#9654;':'&#10074;&#10074;';}
           function after(){busy=false;paused=false;stopBarge();setState('idle','STANDBY');
             if(el('auto').checked){if(SR&&!SRbroken&&stream){startSR();}else if(srvSTT&&stream){startRec();}else if(!stream){setState('idle','TAP MIC TO TALK');}}}
-          function browserSpeak(t){var msg=clean(t).slice(0,600);curU=new SpeechSynthesisUtterance(msg);curU.lang=el('lang').value;var vs=speechSynthesis.getVoices();for(var i=0;i<vs.length;i++){if(vs[i].lang.indexOf(curU.lang.split('-')[0])===0){curU.voice=vs[i];break;}}
+          function scriptLang(t){if(/[\u0980-\u09FF]/.test(t)){return 'bn';}if(/[\u0900-\u097F]/.test(t)){return 'hi';}return 'en';}
+          function voiceFor(t){var sl=scriptLang(t),v=curVoice();if(v.indexOf('st:')===0){if(sl!=='bn'){return v;}return VDEF['bn-BD']||'bn-BD-PradeepNeural';}if(v.indexOf(sl)===0){return v;}if(sl==='bn'){return VDEF['bn-BD']||'bn-BD-PradeepNeural';}if(sl==='hi'){return VDEF['hi-IN']||'hi-IN-MadhurNeural';}return v;}
+          function browserSpeak(t){var msg=clean(t).slice(0,600);curU=new SpeechSynthesisUtterance(msg);var sl=scriptLang(msg);curU.lang=sl==='bn'?'bn-BD':(sl==='hi'?'hi-IN':el('lang').value);var vs=speechSynthesis.getVoices();for(var i=0;i<vs.length;i++){if(vs[i].lang.indexOf(curU.lang.split('-')[0])===0){curU.voice=vs[i];break;}}
             setState('speak','SPEAKING');pbShow(true);paused=false;pbIcon();el('pbFill').style.width='100%';startBarge();
             var done=false;function fin(){if(!done){done=true;pbShow(false);after();}}
             curU.onend=fin;curU.onerror=fin;setTimeout(fin,4000+msg.length*90);
@@ -1556,7 +1657,7 @@ jobs:
             if(elTTS){setState('speak','SPEAKING');
               var ctl=('AbortController' in window)?new AbortController():null;
               var tto=ctl?setTimeout(function(){ctl.abort();},12000):null;
-              fetch('/tts',{method:'POST',headers:{'Content-Type':'application/json','X-Token':tok},body:JSON.stringify({text:clean(t).slice(0,1200),voice:curVoice()}),signal:ctl?ctl.signal:undefined})
+              fetch('/tts',{method:'POST',headers:{'Content-Type':'application/json','X-Token':tok},body:JSON.stringify({text:clean(t).slice(0,1200),voice:voiceFor(clean(t))}),signal:ctl?ctl.signal:undefined})
               .then(function(r){if(!r.ok){throw new Error('tts');}return r.blob();})
               .then(function(b){if(tto){clearTimeout(tto);}if(lastAudioURL){try{URL.revokeObjectURL(lastAudioURL);}catch(e){}}lastAudioURL=URL.createObjectURL(b);playUrl(lastAudioURL);})
               .catch(function(){if(tto){clearTimeout(tto);}browserSpeak(t);});
@@ -1697,6 +1798,74 @@ jobs:
           ]
           VOICE_IDS = set(v["id"] for v in VOICES)
           DEFAULT_VOICES = {"en-US": "en-US-GuyNeural", "bn-BD": "bn-BD-PradeepNeural", "hi-IN": "hi-IN-MadhurNeural"}
+
+          # ---- Supertonic 3: free on-device neural TTS (ONNX, CPU). No API, no limits.
+          # Loads in the background; until ready, /tts transparently uses Edge instead.
+          SUPER = {"ready": False, "tts": None, "styles": {}, "voices": [], "status": "off"}
+          ST_LOCK = threading.Lock()
+
+          def _super_init():
+              try:
+                  from supertonic import TTS as _ST
+              except Exception:
+                  return
+              SUPER["status"] = "loading"
+              try:
+                  t = _ST(auto_download=True)
+                  names = []
+                  for attr in ("list_voice_styles", "list_voices", "voice_names", "voices"):
+                      try:
+                          v = getattr(t, attr)
+                          names = [str(x) for x in (v() if callable(v) else v)]
+                          if names:
+                              break
+                      except Exception:
+                          pass
+                  if not names:
+                      names = ["M1", "M2", "M3", "M4", "M5", "F1", "F2", "F3", "F4", "F5"]
+                  for n in names[:12]:
+                      try:
+                          SUPER["styles"]["st:" + n] = t.get_voice_style(voice_name=n)
+                      except Exception:
+                          pass
+                  if SUPER["styles"]:
+                      SUPER["tts"] = t
+                      for k in sorted(SUPER["styles"]):
+                          nm = k[3:]
+                          sex = "Female" if nm.upper().startswith("F") else "Male"
+                          SUPER["voices"].append({"id": k, "name": "Supertonic " + nm,
+                              "meta": sex + " \u00b7 on-device \u00b7 EN/HI",
+                              "group": "SUPERTONIC 3 \u00b7 ON-DEVICE", "sample": S_EN})
+                      SUPER["ready"] = True
+                      SUPER["status"] = "ready"
+                  else:
+                      SUPER["status"] = "off"
+              except Exception:
+                  SUPER["status"] = "error"
+
+          threading.Thread(target=_super_init, daemon=True).start()
+
+          def script_lang_srv(t):
+              for ch in t:
+                  if "\u0980" <= ch <= "\u09ff":
+                      return "bn"
+                  if "\u0900" <= ch <= "\u097f":
+                      return "hi"
+              return "en"
+
+          def supertonic_speak(text, voice, lang):
+              try:
+                  with ST_LOCK:
+                      wav, _dur = SUPER["tts"].synthesize(text[:1500],
+                          voice_style=SUPER["styles"][voice], lang=lang)
+                  p = "/tmp/st_%s.wav" % uuid.uuid4().hex
+                  SUPER["tts"].save_audio(wav, p)
+                  with open(p, "rb") as f:
+                      b = f.read()
+                  os.remove(p)
+                  return b
+              except Exception:
+                  return None
           UPLOAD_DIR = os.path.expanduser("~/.hermes/work/uploads")
           app = Flask(__name__)
           app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024   # 200 MB uploads
@@ -1741,18 +1910,22 @@ jobs:
               return None
 
           def do_stt(blob, mime, lang):
-              short = (lang or "en").split("-")[0]
+              short = (lang or "").split("-")[0]
               if GROQ:
                   try:
+                      data = {"model": "whisper-large-v3"}
+                      # Never force English: Whisper auto-detects the spoken language,
+                      # so Bangla / Hindi are recognized even when the selector says
+                      # ENGLISH. A non-English selector is passed as an accuracy hint.
+                      if short and short != "en":
+                          data["language"] = short
                       r = rq.post("https://api.groq.com/openai/v1/audio/transcriptions",
                                   headers={"Authorization": "Bearer " + GROQ},
                                   files={"file": ("audio.webm", blob, mime)},
-                                  data={"model": "whisper-large-v3", "language": short},
+                                  data=data,
                                   timeout=90)
                       if r.status_code == 200:
-                          t = (r.json().get("text") or "").strip()
-                          if t:
-                              return t
+                          return (r.json().get("text") or "").strip()
                   except Exception:
                       pass
               for k in el_keys():
@@ -1763,9 +1936,7 @@ jobs:
                                   data={"model_id": "scribe_v1"},
                                   timeout=90)
                       if r.status_code == 200:
-                          t = (r.json().get("text") or "").strip()
-                          if t:
-                              return t
+                          return (r.json().get("text") or "").strip()
                   except Exception:
                       pass
               return None
@@ -1892,7 +2063,8 @@ jobs:
               if request.headers.get("X-Token", "") != TOKEN:
                   return jsonify(error="bad token"), 401
               return jsonify(tts=EDGE, stt=bool(GROQ) or bool(el_keys()),
-                             voices=VOICES, defaults=DEFAULT_VOICES)
+                             voices=VOICES + SUPER["voices"], defaults=DEFAULT_VOICES,
+                             st=SUPER["status"])
 
           @app.route("/tts", methods=["POST"])
           def tts_route():
@@ -1902,7 +2074,18 @@ jobs:
               text = (data.get("text") or "").strip()
               if not text:
                   return jsonify(error="empty"), 400
-              audio = edge_speak(text, (data.get("voice") or "").strip())
+              voice = (data.get("voice") or "").strip()
+              if voice.startswith("st:"):
+                  sl = script_lang_srv(text)
+                  if sl != "bn" and SUPER["ready"] and voice in SUPER["styles"]:
+                      audio = supertonic_speak(text, voice, sl)
+                      if audio:
+                          return Response(audio, mimetype="audio/wav")
+                  # Bangla text, model still loading, or synth failure -> Edge fallback
+                  voice = (DEFAULT_VOICES["bn-BD"] if sl == "bn"
+                           else DEFAULT_VOICES["hi-IN"] if sl == "hi"
+                           else DEFAULT_VOICES["en-US"])
+              audio = edge_speak(text, voice)
               if audio:
                   return Response(audio, mimetype="audio/mpeg")
               return jsonify(error="tts unavailable"), 503
@@ -1916,9 +2099,9 @@ jobs:
                   return jsonify(error="no audio received"), 400
               text = do_stt(blob, request.headers.get("Content-Type", "audio/webm"),
                             request.args.get("lang", "en-US"))
-              if text:
-                  return jsonify(text=text)
-              return jsonify(error="transcription unavailable (add GROQ_API_KEY or ELEVENLABS_KEYS)"), 503
+              if text is None:
+                  return jsonify(error="transcription unavailable (add GROQ_API_KEY or ELEVENLABS_KEYS)"), 503
+              return jsonify(text=text)
 
           @app.route("/upload", methods=["POST"])
           def upload():
@@ -1997,7 +2180,7 @@ jobs:
 
           app.run(host="0.0.0.0", port=7777, threaded=True)
           PYJARVIS
-          pip install -q flask requests edge-tts || true
+          pip install -q flask requests edge-tts supertonic || true
           nohup python3 /tmp/jarvis/app.py > /tmp/jarvis.log 2>&1 &
           sleep 2
           curl -fs http://localhost:7777/ >/dev/null || { echo '::warning::Agent HUD failed to start'; cat /tmp/jarvis.log; }
@@ -2015,6 +2198,11 @@ jobs:
 
 
 
+
+
+
+
+
       # ── 11. Background backup loop (every 30 min -> backup branch) ──
       - name: Start backup loop
         env:
@@ -2023,11 +2211,26 @@ jobs:
           cat > /tmp/sync.sh <<'EOF'
           #!/bin/bash
           while true; do
-            sleep 1800
+            sleep 900
+            # ── STATE MIRROR: capture EVERYTHING Hermes stores outside the tree ──
+            # skills / brain / tasks / memory / config live in the (excluded)
+            # agent dir and in ~/.config, ~/.local — mirror them INTO ~/.hermes
+            # so every backup push carries them to the privatestorage repo.
+            mkdir -p "$HERMES_HOME/xdg-mirror/config" "$HERMES_HOME/xdg-mirror/share" "$HERMES_HOME/xdg-mirror/state" "$HERMES_HOME/agent-state"
+            for d in "$HOME/.config"/hermes* "$HOME/.config"/nous*; do [ -e "$d" ] && rsync -a --delete "$d" "$HERMES_HOME/xdg-mirror/config/" || true; done
+            for d in "$HOME/.local/share"/hermes* "$HOME/.local/share"/nous*; do [ -e "$d" ] && rsync -a --delete "$d" "$HERMES_HOME/xdg-mirror/share/" || true; done
+            for d in "$HOME/.local/state"/hermes* "$HOME/.local/state"/nous*; do [ -e "$d" ] && rsync -a --delete "$d" "$HERMES_HOME/xdg-mirror/state/" || true; done
+            for d in skills skill brain brains memory memories tasks task knowledge notes sessions session prompts plugins tools agents config configs data db; do
+              [ -e "$HERMES_HOME/hermes-agent/$d" ] && rsync -a --delete "$HERMES_HOME/hermes-agent/$d" "$HERMES_HOME/agent-state/" || true
+            done
+            find "$HERMES_HOME/hermes-agent" -maxdepth 1 -type f \( -name '*.json' -o -name '*.yaml' -o -name '*.yml' -o -name '*.md' -o -name '*.txt' -o -name '*.db' -o -name '*.sqlite' -o -name '*.sqlite3' \) -exec cp -a {} "$HERMES_HOME/agent-state/" \; 2>/dev/null || true
             rm -rf /tmp/backup && mkdir -p /tmp/backup
             rsync -a --exclude='.env' --exclude='.git' --exclude='*.log' --exclude='hermes-agent' \
               --exclude='browser-profile/cache2' --exclude='browser-profile/startupCache' \
               --exclude='browser-profile/shader-cache' \
+              --exclude='chrome-profile/Default/Cache' --exclude='chrome-profile/Default/Code Cache' \
+              --exclude='chrome-profile/Default/GPUCache' --exclude='chrome-profile/ShaderCache' \
+              --exclude='chrome-profile/GraphiteDawnCache' \
               "$HERMES_HOME/" /tmp/backup/
             cd /tmp/backup
             find . -type f -size +90M | while read -r f; do
@@ -2178,10 +2381,25 @@ jobs:
         env:
           DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
         run: |
+          # ── STATE MIRROR: capture EVERYTHING Hermes stores outside the tree ──
+          # skills / brain / tasks / memory / config live in the (excluded)
+          # agent dir and in ~/.config, ~/.local — mirror them INTO ~/.hermes
+          # so every backup push carries them to the privatestorage repo.
+          mkdir -p "$HERMES_HOME/xdg-mirror/config" "$HERMES_HOME/xdg-mirror/share" "$HERMES_HOME/xdg-mirror/state" "$HERMES_HOME/agent-state"
+          for d in "$HOME/.config"/hermes* "$HOME/.config"/nous*; do [ -e "$d" ] && rsync -a --delete "$d" "$HERMES_HOME/xdg-mirror/config/" || true; done
+          for d in "$HOME/.local/share"/hermes* "$HOME/.local/share"/nous*; do [ -e "$d" ] && rsync -a --delete "$d" "$HERMES_HOME/xdg-mirror/share/" || true; done
+          for d in "$HOME/.local/state"/hermes* "$HOME/.local/state"/nous*; do [ -e "$d" ] && rsync -a --delete "$d" "$HERMES_HOME/xdg-mirror/state/" || true; done
+          for d in skills skill brain brains memory memories tasks task knowledge notes sessions session prompts plugins tools agents config configs data db; do
+            [ -e "$HERMES_HOME/hermes-agent/$d" ] && rsync -a --delete "$HERMES_HOME/hermes-agent/$d" "$HERMES_HOME/agent-state/" || true
+          done
+          find "$HERMES_HOME/hermes-agent" -maxdepth 1 -type f \( -name '*.json' -o -name '*.yaml' -o -name '*.yml' -o -name '*.md' -o -name '*.txt' -o -name '*.db' -o -name '*.sqlite' -o -name '*.sqlite3' \) -exec cp -a {} "$HERMES_HOME/agent-state/" \; 2>/dev/null || true
           rm -rf /tmp/final && mkdir -p /tmp/final
           rsync -a --exclude='.env' --exclude='.git' --exclude='*.log' --exclude='hermes-agent' \
             --exclude='browser-profile/cache2' --exclude='browser-profile/startupCache' \
             --exclude='browser-profile/shader-cache' \
+            --exclude='chrome-profile/Default/Cache' --exclude='chrome-profile/Default/Code Cache' \
+            --exclude='chrome-profile/Default/GPUCache' --exclude='chrome-profile/ShaderCache' \
+            --exclude='chrome-profile/GraphiteDawnCache' \
             "$HERMES_HOME/" /tmp/final/ || true
           cd /tmp/final
           find . -type f -size +90M | while read -r f; do
