@@ -1164,7 +1164,7 @@ jobs:
           cat > /tmp/jarvis/index.html <<'HUDHTML'
           <!doctype html>
           <html><head><meta charset="utf-8">
-          <meta name="viewport" content="width=device-width,initial-scale=1">
+          <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,interactive-widget=resizes-content">
           <title>AGENT HUD</title>
           <link rel="preconnect" href="https://fonts.googleapis.com">
           <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -1178,7 +1178,8 @@ jobs:
             --amber:#fbbf24;--amber-soft:rgba(251,191,36,.12);
             --red:#f87171;--red-soft:rgba(248,113,113,.12);
           }
-          *{margin:0;padding:0;box-sizing:border-box}
+          *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+          button,select,input,.vrow{touch-action:manipulation}
           html,body{height:100%}
           body{background:var(--bg);color:var(--text);font-family:Inter,system-ui,sans-serif;min-height:100dvh;overflow:hidden;font-size:15px;line-height:1.5}
           body:before{content:"";position:fixed;inset:0;z-index:0;pointer-events:none;
@@ -1261,7 +1262,7 @@ jobs:
           #top .tl{display:flex;align-items:center;gap:10px;font-family:"JetBrains Mono",monospace;font-size:11px;letter-spacing:.24em;color:var(--dim);text-transform:uppercase}
           #top .tl i{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 8px var(--green)}
           #clock{font-family:"JetBrains Mono",monospace;font-size:11px;color:var(--faint);letter-spacing:.14em}
-          #log{flex:1;min-height:0;overflow-y:auto;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px;backdrop-filter:blur(10px);scroll-behavior:smooth}
+          #log{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px;backdrop-filter:blur(10px);scroll-behavior:smooth}
           #log::-webkit-scrollbar{width:8px}#log::-webkit-scrollbar-thumb{background:#1e2f44;border-radius:8px}
           #empty{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;color:var(--faint);text-align:center}
           #empty .t{font-family:Orbitron,monospace;letter-spacing:.3em;font-size:13px;color:#3f5b75}
@@ -1332,7 +1333,55 @@ jobs:
           .vrow .vm{font-size:11px;color:var(--faint);letter-spacing:.06em;margin-top:2px}
           .vrow .prev{margin-left:auto}
           #vfoot{padding:11px 18px;border-top:1px solid var(--line);font-size:11px;color:var(--faint);letter-spacing:.08em}
-          @media(max-width:919px){#left{flex-direction:row;flex-wrap:wrap;justify-content:center;gap:10px;padding:12px}#reactor{width:clamp(95px,20vmin,130px);margin:0}#brand{width:100%}#bars{display:none}#top{display:none}}
+          /* ---------- MOBILE ---------- */
+          @media(max-width:919px){
+            #wrap{padding:8px;gap:8px;padding-left:max(8px,env(safe-area-inset-left));padding-right:max(8px,env(safe-area-inset-right));padding-bottom:max(8px,env(safe-area-inset-bottom))}
+            /* compact console: brand strip, then reactor + state + mic in one row */
+            #left{flex-direction:row;flex-wrap:wrap;justify-content:center;align-items:center;gap:6px 14px;padding:10px 12px 12px}
+            #brand{width:100%}
+            h1{font-size:19px;letter-spacing:.34em;padding-left:.34em}
+            #sub{font-size:8.5px;letter-spacing:.26em;margin-top:3px}
+            #reactor{width:clamp(84px,24vw,110px);margin:0}
+            #state{font-size:9.5px;letter-spacing:.2em;padding:7px 13px}
+            #mic{width:58px}
+            #bars{display:none}#top{display:none}#engine{display:none}
+            #interrupt{padding:10px 16px;min-height:44px}
+            /* options: full-width row with comfortable touch sizes */
+            #opts{width:100%;gap:10px 14px}
+            select{padding:10px 12px;font-size:14px;min-height:42px}
+            .tog{font-size:10px;min-height:42px}
+            .tog input{width:36px;height:20px}
+            .tog input:before{width:14px;height:14px}
+            .tog input:checked:before{left:19px}
+            #vmb{padding:11px 14px;min-height:42px}
+            /* conversation: denser padding, wider bubbles, readable text */
+            #log{padding:12px;border-radius:12px}
+            .msg{max-width:94%;margin-bottom:13px}
+            .msg pre{font-size:14px}
+            #empty .d{max-width:260px}
+            #live{font-size:13px;min-height:18px}
+            /* composer: 16px input stops iOS zoom-on-focus; 46px touch targets */
+            #inrow{gap:7px}
+            #txt{font-size:16px;padding:12px 13px}
+            button.act{min-height:46px;padding:0 15px}
+            #attach{min-width:46px;font-size:17px}
+            .icon{width:44px;height:44px;font-size:15px}
+            .chip{padding:7px 11px;font-size:11.5px}
+            .chip button{font-size:16px;padding:2px 5px}
+            /* playback bar: drop the label, keep track + big controls */
+            #pbar{gap:8px;padding:8px 10px}
+            #pbar .lbl{display:none}
+            /* voice model panel becomes a bottom sheet */
+            #vmask{align-items:flex-end}
+            #vpanel{width:100%;max-width:none;max-height:80dvh;border-radius:18px 18px 0 0;border-bottom:none}
+            #vhead{padding:14px 16px}
+            .vrow{padding:12px;gap:10px}
+            .vrow .prev{width:44px;height:44px}
+            #vfoot{padding:11px 16px;padding-bottom:max(11px,env(safe-area-inset-bottom))}
+            /* token gate fits small screens */
+            #gatebox{margin:0 16px;padding:26px 22px;width:100%;max-width:360px}
+            #gatebox input,#gatebox button{width:100%}
+          }
           </style></head>
           <body class="idle">
           <div id="grid"></div>
@@ -1390,6 +1439,7 @@ jobs:
           var vadT=null,actx=null,t0=0,recSpoke=false,srT=null,srLast='';
           var bargeT=null,paused=false,lastReply='',lastAudioURL=null,curJob=null,thinkT=null,thinkStart=0;
           var files=[];
+          var hist=[];
 
           var VOICES=[],VDEF={};
           function boot(){fetch('/config',{headers:{'X-Token':tok}}).then(function(r){return r.json();}).then(function(j){elTTS=!!j.tts;srvSTT=!!j.stt;VOICES=j.voices||[];VDEF=j.defaults||{};el('engine').textContent='VOICE '+(elTTS?'EDGE NEURAL · FREE':'BROWSER')+' · EARS '+(srvSTT?'SERVER+BROWSER':'BROWSER');}).catch(function(){});}
@@ -1484,20 +1534,35 @@ jobs:
             var chunks=[];recSpoke=false;
             try{mrec=new MediaRecorder(stream);}catch(e){toast('Audio recording not supported in this browser.');return;}
             mrec.ondataavailable=function(e){chunks.push(e.data);};
-            mrec.onstop=function(){stopVad();var b=new Blob(chunks,{type:mrec.mimeType||'audio/webm'});if(recSpoke&&b.size>2000){sendSTT(b);}else{setState('idle','STANDBY');if(el('auto').checked&&!busy){setTimeout(startRec,400);}}};
+            mrec.onstop=function(){stopVad();el('live').textContent='';var b=new Blob(chunks,{type:mrec.mimeType||'audio/webm'});
+              /* send when voice was detected OR the clip is big enough that the meter
+                 may simply have missed it — let Whisper decide, never discard words */
+              if((recSpoke&&b.size>2000)||b.size>12000){sendSTT(b);}
+              else{setState('idle','STANDBY');if(el('auto').checked&&!busy){setTimeout(startRec,400);}}};
             mrec.start();listening=true;el('mic').classList.add('on');setState('listen','LISTENING — SPEAK');
             t0=Date.now();
             try{
               actx=new (window.AudioContext||window.webkitAudioContext)();
+              if(actx.state==='suspended'){actx.resume();}
               var src=actx.createMediaStreamSource(stream),an=actx.createAnalyser();an.fftSize=512;src.connect(an);
-              var data=new Uint8Array(an.fftSize),quiet=0;
+              var data=new Uint8Array(an.fftSize),quiet=0,nf=0,ticks=0,flat=0;
               vadT=setInterval(function(){
                 an.getByteTimeDomainData(data);
                 var m=0;for(var i=0;i<data.length;i++){var v=Math.abs(data[i]-128);if(v>m){m=v;}}
-                if(m>10){recSpoke=true;quiet=0;}else if(recSpoke){quiet+=100;}
-                if((recSpoke&&quiet>=1400)||Date.now()-t0>25000){stopListen(false);}
+                ticks++;
+                if(ticks<=4){nf=Math.max(nf,m);return;} /* first 400ms: learn the room's noise floor */
+                if(m===0){flat+=100;}else{flat=0;}
+                if(flat>=2000){ /* analyser returns silence (privacy shields) -> timed mode */
+                  clearInterval(vadT);vadT=null;recSpoke=true;
+                  el('live').textContent='● voice meter blocked by browser shields — recording 8s then sending';
+                  setTimeout(function(){if(mrec&&mrec.state==='recording'){stopListen(false);}},Math.max(300,8000-(Date.now()-t0)));
+                  return;}
+                var th=Math.max(6,Math.min(20,nf*1.8+3)); /* adaptive: just above the noise floor */
+                if(m>th){if(!recSpoke){el('live').textContent='● hearing you — pause when done and I will send';}recSpoke=true;quiet=0;}
+                else if(recSpoke){quiet+=100;}
+                if((recSpoke&&quiet>=1500)||Date.now()-t0>25000){stopListen(false);}
               },100);
-            }catch(e){recSpoke=true;}
+            }catch(e){recSpoke=true;setTimeout(function(){if(mrec&&mrec.state==='recording'){stopListen(false);}},8000);}
           }
           function stopListen(user){
             clearTimeout(srT);
@@ -1505,7 +1570,7 @@ jobs:
             if(mrec&&mrec.state==='recording'){if(user){recSpoke=true;}micOff();mrec.stop();return;}
             if(user){setState('idle','STANDBY');}
           }
-          function sendSTT(b){setState('think','TRANSCRIBING');fetch('/stt?lang='+el('lang').value,{method:'POST',headers:{'X-Token':tok,'Content-Type':b.type||'audio/webm'},body:b}).then(function(r){return r.json();}).then(function(j){if(j.text){send(j.text);}else{toast(j.error||'Transcription failed');setState('idle','STANDBY');}}).catch(function(){toast('Transcription request failed');setState('idle','STANDBY');});}
+          function sendSTT(b){setState('think','TRANSCRIBING');fetch('/stt?lang='+el('lang').value,{method:'POST',headers:{'X-Token':tok,'Content-Type':b.type||'audio/webm'},body:b}).then(function(r){return r.json();}).then(function(j){if(j.text){send(j.text);}else if(j.error){toast(j.error);setState('idle','STANDBY');}else{toast('I heard audio but no clear words — speak a little closer, Boss.',1);setState('idle','STANDBY');if(el('auto').checked&&!busy){setTimeout(startRec,500);}}}).catch(function(){toast('Transcription request failed');setState('idle','STANDBY');});}
 
           /* ---------- barge-in: speak to interrupt agent voice ---------- */
           function stopBarge(){if(bargeT){clearInterval(bargeT);bargeT=null;}}
@@ -1591,7 +1656,7 @@ jobs:
 
           /* ---------- jobs ---------- */
           function stopThink(){if(thinkT){clearInterval(thinkT);thinkT=null;}}
-          function poll(id){fetch('/poll?id='+id,{headers:{'X-Token':tok}}).then(function(r){return r.json();}).then(function(j){if(j.done){stopThink();curJob=null;addMsg('AGENT',j.reply);speak(j.reply);}else{setTimeout(function(){poll(id);},2500);}}).catch(function(){setTimeout(function(){poll(id);},4000);});}
+          function poll(id){fetch('/poll?id='+id,{headers:{'X-Token':tok}}).then(function(r){return r.json();}).then(function(j){if(j.done){stopThink();curJob=null;hist.push({role:'assistant',content:j.reply});if(hist.length>10){hist=hist.slice(-10);}addMsg('AGENT',j.reply);speak(j.reply);}else{setTimeout(function(){poll(id);},1000);}}).catch(function(){setTimeout(function(){poll(id);},2500);});}
           function send(text){
             if(!text&&!files.length){return;}
             if(busy){toast('Previous task still running, Boss.');return;}
@@ -1602,7 +1667,8 @@ jobs:
             files=[];renderChips();
             thinkStart=Date.now();setState('think','PROCESSING');stopThink();
             thinkT=setInterval(function(){var s=Math.floor((Date.now()-thinkStart)/1000);var mm=String(Math.floor(s/60)).padStart(2,'0');var ss=String(s%60).padStart(2,'0');el('stateTxt').textContent='PROCESSING · '+mm+':'+ss;},1000);
-            fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json','X-Token':tok},body:JSON.stringify({text:text,files:paths})}).then(function(r){return r.json();}).then(function(j){if(j.job){curJob=j.job;poll(j.job);}else{busy=false;stopThink();addMsg('AGENT',j.error||'request failed');setState('idle','STANDBY');}}).catch(function(e){busy=false;stopThink();addMsg('AGENT','Connection error: '+e);setState('idle','STANDBY');});
+            var h=hist.slice(-8);hist.push({role:'user',content:text||'(files attached)'});
+            fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json','X-Token':tok},body:JSON.stringify({text:text,files:paths,history:h})}).then(function(r){return r.json();}).then(function(j){if(j.job){curJob=j.job;poll(j.job);}else{busy=false;stopThink();addMsg('AGENT',j.error||'request failed');setState('idle','STANDBY');}}).catch(function(e){busy=false;stopThink();addMsg('AGENT','Connection error: '+e);setState('idle','STANDBY');});
           }
 
           /* ---------- file input ---------- */
@@ -1748,9 +1814,7 @@ jobs:
                                   data={"model": "whisper-large-v3", "language": short},
                                   timeout=90)
                       if r.status_code == 200:
-                          t = (r.json().get("text") or "").strip()
-                          if t:
-                              return t
+                          return (r.json().get("text") or "").strip()
                   except Exception:
                       pass
               for k in el_keys():
@@ -1761,9 +1825,7 @@ jobs:
                                   data={"model_id": "scribe_v1"},
                                   timeout=90)
                       if r.status_code == 200:
-                          t = (r.json().get("text") or "").strip()
-                          if t:
-                              return t
+                          return (r.json().get("text") or "").strip()
                   except Exception:
                       pass
               return None
@@ -1802,6 +1864,56 @@ jobs:
                       continue
                   keep.append(s)
               return "\n".join(keep).strip() or out
+
+
+          ROUTER = "http://localhost:4000/v1/chat/completions"
+          FAST_SYS = ("You are Hermes, a JARVIS-style AI agent speaking to your Boss through a "
+                      "voice HUD. You also have a separate FULL AGENT mode with tools (terminal, "
+                      "web browsing, web search, files, code execution) that is powerful but slow. "
+                      "Decide how to handle the user's message: "
+                      "(a) If it is small talk, a greeting, a quick factual or opinion question you "
+                      "can answer from knowledge, or a short writing/translation request - answer "
+                      "it DIRECTLY yourself. Be concise and speech-friendly (1-4 short sentences), "
+                      "confident and warm, and address the user as Boss. Reply in the user's language. "
+                      "(b) If it genuinely needs tools, live/current information, browsing, scraping, "
+                      "files, running code, or long multi-step work - reply with EXACTLY this token "
+                      "and nothing else: [[AGENT]]")
+
+          def fast_answer(text, hist):
+              # One quick call to the local pool router. Returns a direct reply,
+              # or None when the message should go to the full agent.
+              msgs = [{"role": "system", "content": FAST_SYS}]
+              for m in hist[-6:]:
+                  if (isinstance(m, dict) and m.get("role") in ("user", "assistant")
+                          and isinstance(m.get("content"), str)):
+                      msgs.append({"role": m["role"], "content": m["content"][:1200]})
+              msgs.append({"role": "user", "content": text[:4000]})
+              try:
+                  r = rq.post(ROUTER,
+                              headers={"Authorization": "Bearer sk-local",
+                                       "Content-Type": "application/json"},
+                              json={"model": "pool-auto", "messages": msgs,
+                                    "max_tokens": 500, "temperature": 0.6},
+                              timeout=15)
+                  if r.status_code == 200:
+                      out = (r.json()["choices"][0]["message"]["content"] or "").strip()
+                      if out and "[[AGENT]]" not in out:
+                          return out
+              except Exception:
+                  pass
+              return None
+
+          def run_dispatch(jid, text, hist, deep):
+              # Try the fast lane first (unless files are attached / forced deep);
+              # fall back to the full agent when the router says [[AGENT]].
+              if not deep:
+                  fast = fast_answer(text, hist)
+                  if JOBS.get(jid, {}).get("done"):
+                      return  # interrupted while the fast lane was running
+                  if fast is not None:
+                      JOBS[jid] = {"done": True, "reply": fast[-6000:]}
+                      return
+              run_job(jid, text)
 
           def run_job(jid, text):
               env = dict(os.environ, NO_COLOR="1", TERM="dumb", DISPLAY=":99")
@@ -1864,9 +1976,9 @@ jobs:
                   return jsonify(error="no audio received"), 400
               text = do_stt(blob, request.headers.get("Content-Type", "audio/webm"),
                             request.args.get("lang", "en-US"))
-              if text:
-                  return jsonify(text=text)
-              return jsonify(error="transcription unavailable (add GROQ_API_KEY or ELEVENLABS_KEYS)"), 503
+              if text is None:
+                  return jsonify(error="transcription unavailable (add GROQ_API_KEY or ELEVENLABS_KEYS)"), 503
+              return jsonify(text=text)
 
           @app.route("/upload", methods=["POST"])
           def upload():
@@ -1904,9 +2016,13 @@ jobs:
                           + ", ".join(safe)
                           + " - use your terminal/files tools to read them. "
                           + (text or "Inspect the file(s) and report what they contain, Boss."))
+              hist = data.get("history") or []
+              if not isinstance(hist, list):
+                  hist = []
               jid = uuid.uuid4().hex
               JOBS[jid] = {"done": False}
-              threading.Thread(target=run_job, args=(jid, text), daemon=True).start()
+              threading.Thread(target=run_dispatch, args=(jid, text, hist[-8:], bool(safe)),
+                               daemon=True).start()
               return jsonify(job=jid)
 
           @app.route("/stop", methods=["POST"])
@@ -1915,10 +2031,12 @@ jobs:
               if request.headers.get("X-Token", "") != TOKEN:
                   return jsonify(error="bad token"), 401
               jid = request.args.get("id", "")
+              if jid not in JOBS:
+                  return jsonify(ok=False, error="unknown job")
+              JOBS[jid] = {"done": True, "reply": "Task interrupted by you, Boss. Standing by."}
               p = PROCS.get(jid)
               if not p:
-                  return jsonify(ok=False, error="no running job")
-              JOBS[jid] = {"done": True, "reply": "Task interrupted by you, Boss. Standing by."}
+                  return jsonify(ok=True)
               try:
                   os.killpg(os.getpgid(p.pid), signal.SIGTERM)
               except Exception:
@@ -1952,6 +2070,9 @@ jobs:
           done
           echo "JARVIS_URL=$JARVIS_URL" >> "$GITHUB_ENV"
           echo "::notice title=🤖 Agent HUD::${JARVIS_URL:-tunnel failed}"
+
+
+
 
 
 
