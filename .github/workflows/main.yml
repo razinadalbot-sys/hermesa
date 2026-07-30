@@ -1152,7 +1152,8 @@ jobs:
       # interrupt button, and drag-and-drop file uploads saved into
       # ~/.hermes/work/uploads/ (persisted) so the agent can work on them.
       # Every command runs the FULL Hermes agent via `hermes chat -q`.
-      # Protected by PANEL_TOKEN.
+      # Voice replies use FREE Microsoft Edge neural TTS (no key needed);
+      # pick + preview voices in the VOICE MODEL panel. Protected by PANEL_TOKEN.
       - name: Start Agent HUD interface
         env:
           PANEL_TOKEN: ${{ secrets.PANEL_TOKEN }}
@@ -1305,6 +1306,7 @@ jobs:
           #sendb{background:linear-gradient(180deg,rgba(14,116,168,.55),rgba(7,63,94,.55));border-color:var(--line2);color:#d6f1ff}
           #attach{font-size:15px}
 
+          #toast.info{background:rgba(8,30,42,.95);border-color:rgba(95,220,255,.45);color:#bfeaff}
           #toast{position:fixed;top:14px;left:50%;transform:translateX(-50%);background:rgba(48,14,20,.95);border:1px solid rgba(248,113,113,.5);color:#fecdd3;padding:10px 18px;border-radius:10px;z-index:30;display:none;max-width:92vw;font-size:13.5px;backdrop-filter:blur(6px)}
           #drop{position:fixed;inset:0;z-index:25;display:none;align-items:center;justify-content:center;background:rgba(3,7,12,.82);border:2px dashed var(--accent);backdrop-filter:blur(4px)}
           #drop div{font-family:Orbitron,monospace;letter-spacing:.3em;color:#7dd3fc;font-size:15px}
@@ -1314,6 +1316,22 @@ jobs:
           #gatebox p{font-size:11.5px;color:var(--faint);margin-bottom:16px;letter-spacing:.06em}
           #gatebox input{background:rgba(8,14,22,.9);border:1px solid var(--line);color:#cfe6f7;padding:11px 13px;border-radius:9px;margin-bottom:12px;width:250px;font-family:"JetBrains Mono",monospace;letter-spacing:.1em}
           #gatebox button{width:250px;padding:11px}
+          #vmb{background:rgba(8,14,22,.7);border:1px solid var(--line);color:#9fd8f2;padding:8px 12px;border-radius:9px;font-family:Orbitron,monospace;font-size:10px;letter-spacing:.18em;cursor:pointer;transition:.2s}
+          #vmb:hover{border-color:rgba(95,220,255,.5);color:#dff4ff;box-shadow:0 0 14px rgba(95,220,255,.15)}
+          #vmask{position:fixed;inset:0;background:rgba(2,8,16,.72);backdrop-filter:blur(6px);z-index:40;display:none;align-items:center;justify-content:center}
+          #vmask.show{display:flex}
+          #vpanel{width:min(580px,94vw);max-height:82vh;display:flex;flex-direction:column;background:var(--panel2);border:1px solid var(--line2);border-radius:14px;box-shadow:0 0 80px rgba(56,189,248,.14);overflow:hidden}
+          #vhead{padding:15px 18px;border-bottom:1px solid var(--line);font-family:Orbitron,monospace;letter-spacing:.24em;font-size:12px;color:#a8def7;display:flex;justify-content:space-between;align-items:center}
+          #vlist{overflow-y:auto;padding:8px 10px}
+          .vgroup{font-family:Orbitron,monospace;font-size:9.5px;letter-spacing:.3em;color:var(--faint);padding:14px 10px 5px}
+          .vrow{display:flex;align-items:center;gap:12px;padding:9px 12px;border:1px solid transparent;border-radius:10px;cursor:pointer;transition:.15s}
+          .vrow:hover{background:rgba(95,220,255,.05)}
+          .vrow.sel{border-color:rgba(95,220,255,.45);background:rgba(95,220,255,.08)}
+          .vrow .vn{font-size:14px;color:#dbeafe}
+          .vrow.sel .vn{color:#eaffff}
+          .vrow .vm{font-size:11px;color:var(--faint);letter-spacing:.06em;margin-top:2px}
+          .vrow .prev{margin-left:auto}
+          #vfoot{padding:11px 18px;border-top:1px solid var(--line);font-size:11px;color:var(--faint);letter-spacing:.08em}
           @media(max-width:919px){#left{flex-direction:row;flex-wrap:wrap;justify-content:center;gap:10px;padding:12px}#reactor{width:clamp(95px,20vmin,130px);margin:0}#brand{width:100%}#bars{display:none}#top{display:none}}
           </style></head>
           <body class="idle">
@@ -1343,6 +1361,7 @@ jobs:
               <label class="tog"><input type="checkbox" id="voice" checked>Voice</label>
               <label class="tog"><input type="checkbox" id="auto" checked>Auto-ear</label>
             </div>
+            <button id="vmb" title="Preview and choose the agent voice">♪ VOICE MODEL</button>
             <div id="engine"></div>
            </div>
            <div id="right">
@@ -1359,23 +1378,26 @@ jobs:
             <input type="file" id="fpick" multiple style="display:none">
            </div>
           </div>
+          <div id="vmask"><div id="vpanel"><div id="vhead"><span>VOICE MODEL · EDGE NEURAL</span><button class="icon" id="vclose" title="Close">&#10005;</button></div><div id="vlist"></div><div id="vfoot">Tap &#9654; to hear a preview · tap a row to select · saved on this device</div></div></div>
           <div id="gate"><div id="gatebox"><h2>ACCESS TOKEN</h2><p>Enter your PANEL_TOKEN secret to engage</p><input id="tok" type="password" placeholder="PANEL_TOKEN"><br><button class="act" id="tokb">ENGAGE</button></div></div>
           <script>
           function el(id){return document.getElementById(id);}
           var tok=localStorage.getItem('jtok')||'';
           var elTTS=false,srvSTT=false,SRbroken=false,busy=false;
           var SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+          if(navigator.brave){SRbroken=true;} /* Brave blocks the browser speech service; go straight to server ears */
           var rec=null,mrec=null,stream=null,listening=false,curA=null,curU=null;
           var vadT=null,actx=null,t0=0,recSpoke=false,srT=null,srLast='';
           var bargeT=null,paused=false,lastReply='',lastAudioURL=null,curJob=null,thinkT=null,thinkStart=0;
           var files=[];
 
-          function boot(){fetch('/config',{headers:{'X-Token':tok}}).then(function(r){return r.json();}).then(function(j){elTTS=!!j.tts;srvSTT=!!j.stt;el('engine').textContent='VOICE '+(elTTS?'ELEVENLABS':'BROWSER')+' · EARS '+(srvSTT?'SERVER+BROWSER':'BROWSER');}).catch(function(){});}
+          var VOICES=[],VDEF={};
+          function boot(){fetch('/config',{headers:{'X-Token':tok}}).then(function(r){return r.json();}).then(function(j){elTTS=!!j.tts;srvSTT=!!j.stt;VOICES=j.voices||[];VDEF=j.defaults||{};el('engine').textContent='VOICE '+(elTTS?'EDGE NEURAL · FREE':'BROWSER')+' · EARS '+(srvSTT?'SERVER+BROWSER':'BROWSER');}).catch(function(){});}
           if(tok){el('gate').style.display='none';boot();}
           el('tokb').onclick=function(){tok=el('tok').value.trim();localStorage.setItem('jtok',tok);el('gate').style.display='none';boot();};
           el('tok').addEventListener('keydown',function(e){if(e.key==='Enter'){el('tokb').onclick();}});
 
-          function toast(m){var t=el('toast');t.textContent=m;t.style.display='block';clearTimeout(t.h);t.h=setTimeout(function(){t.style.display='none';},6000);}
+          function toast(m,info){var t=el('toast');t.className=info?'info':'';t.textContent=m;t.style.display='block';clearTimeout(t.h);t.h=setTimeout(function(){t.style.display='none';},6000);}
           function setState(s,l){document.body.className=s;el('stateTxt').textContent=l;}
           function fmtSz(n){if(n>1048576){return (n/1048576).toFixed(1)+' MB';}if(n>1024){return Math.round(n/1024)+' KB';}return n+' B';}
           function addMsg(who,text,att){var e=el('empty');if(e){e.remove();}
@@ -1387,6 +1409,41 @@ jobs:
             d.appendChild(m);d.appendChild(bd);el('log').appendChild(d);el('log').scrollTop=el('log').scrollHeight;}
           function clean(t){return t.replace(/```[\s\S]*?```/g,' code block ').replace(/https?:\S+/g,' link ').replace(/[*_#`>|]/g,' ').replace(/\s+/g,' ').trim();}
 
+
+          /* ---------- voice model panel (free Microsoft Edge neural voices) ---------- */
+          var pvA=null,pvBtn=null;
+          function curVoice(){var v=localStorage.getItem('jvoice');if(v){return v;}return VDEF[el('lang').value]||'en-US-GuyNeural';}
+          function stopPreview(){if(pvA){try{pvA.pause();}catch(e){}pvA=null;}if(pvBtn){pvBtn.innerHTML='&#9654;';pvBtn=null;}}
+          function buildVoices(){
+            var L=el('vlist');L.innerHTML='';var sel=curVoice(),lastG='';
+            if(!VOICES.length){L.innerHTML='<div class="vgroup">VOICE LIST UNAVAILABLE — CHECK CONNECTION</div>';return;}
+            VOICES.forEach(function(v){
+              if(v.group!==lastG){lastG=v.group;var g=document.createElement('div');g.className='vgroup';g.textContent=v.group;L.appendChild(g);}
+              var r=document.createElement('div');r.className='vrow'+(v.id===sel?' sel':'');
+              var t=document.createElement('div');
+              var n=document.createElement('div');n.className='vn';n.textContent=v.name;
+              var m=document.createElement('div');m.className='vm';m.textContent=v.meta;
+              t.appendChild(n);t.appendChild(m);
+              var p=document.createElement('button');p.className='icon prev';p.innerHTML='&#9654;';p.title='Preview this voice';
+              p.onclick=function(ev){ev.stopPropagation();preview(v,p);};
+              r.appendChild(t);r.appendChild(p);
+              r.onclick=function(){localStorage.setItem('jvoice',v.id);var rows=L.querySelectorAll('.vrow');for(var i=0;i<rows.length;i++){rows[i].className='vrow';}r.className='vrow sel';toast('Agent voice set to '+v.name+', Boss.',1);};
+              L.appendChild(r);
+            });
+          }
+          function preview(v,btn){
+            if(pvBtn===btn){stopPreview();return;}
+            stopPreview();stopVoice();
+            btn.innerHTML='&#8987;';pvBtn=btn;
+            fetch('/tts',{method:'POST',headers:{'Content-Type':'application/json','X-Token':tok},body:JSON.stringify({text:v.sample||'Hello Boss. I am online and ready for your orders.',voice:v.id})})
+            .then(function(r){if(!r.ok){throw new Error('tts');}return r.blob();})
+            .then(function(b){if(pvBtn!==btn){return;}pvA=new Audio(URL.createObjectURL(b));btn.innerHTML='&#9632;';pvA.onended=function(){stopPreview();};pvA.play().catch(function(){stopPreview();toast('Preview blocked by the browser — tap once more.');});})
+            .catch(function(){stopPreview();toast('Preview failed — Edge TTS unreachable right now.');});
+          }
+          el('vmb').onclick=function(){buildVoices();el('vmask').className='show';};
+          el('vclose').onclick=function(){stopPreview();el('vmask').className='';};
+          el('vmask').addEventListener('click',function(e){if(e.target===el('vmask')){stopPreview();el('vmask').className='';}});
+
           /* ---------- clock ---------- */
           setInterval(function(){var c=el('clock');if(c){c.textContent=new Date().toLocaleString([],{weekday:'short',hour:'2-digit',minute:'2-digit',second:'2-digit'}).toUpperCase();}},1000);
 
@@ -1395,7 +1452,7 @@ jobs:
           function ensureStream(cb){
             if(stream){cb();return;}
             if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){toast('This browser cannot access the microphone. Use Chrome or Edge over HTTPS.');return;}
-            navigator.mediaDevices.getUserMedia({audio:true}).then(function(st){stream=st;cb();}).catch(function(){toast('Microphone blocked. Click the lock icon in the address bar, allow Microphone, then tap MIC again.');});
+            navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}}).then(function(st){stream=st;cb();}).catch(function(){toast('Microphone blocked. Click the lock icon in the address bar, allow Microphone, then tap MIC again.');});
           }
           function micClick(){
             if(listening){stopListen(true);return;}
@@ -1416,7 +1473,7 @@ jobs:
             rec.onerror=function(ev){clearTimeout(srT);micOff();
               if(ev.error==='no-speech'){if(el('auto').checked&&!busy){setTimeout(startSR,300);}else{setState('idle','STANDBY');}}
               else if(ev.error==='not-allowed'||ev.error==='service-not-allowed'){toast('Mic permission denied — allow Microphone for this site.');setState('idle','STANDBY');}
-              else if(ev.error==='network'){if(srvSTT){SRbroken=true;toast('Browser speech service unreachable — switched to server ears. Just speak; it auto-sends when you pause.');startRec();}else{toast('Speech service unreachable. Use Chrome desktop/Android, or add GROQ_API_KEY for server transcription.');setState('idle','STANDBY');}}
+              else if(ev.error==='network'){if(srvSTT){SRbroken=true;toast('Using server ears — just speak, it auto-sends when you pause.',1);startRec();}else{toast('Speech service unreachable. Use Chrome desktop/Android, or add GROQ_API_KEY for server transcription.');setState('idle','STANDBY');}}
               else{toast('Mic error: '+ev.error);setState('idle','STANDBY');}};
             rec.onend=function(){if(listening){micOff();if(el('auto').checked&&!busy){setTimeout(startSR,300);}else{setState('idle','STANDBY');}}};
             try{rec.start();}catch(e){toast('Could not start mic: '+e);}
@@ -1458,13 +1515,14 @@ jobs:
             try{
               var bctx=new (window.AudioContext||window.webkitAudioContext)();
               var src=bctx.createMediaStreamSource(stream),an=bctx.createAnalyser();an.fftSize=512;src.connect(an);
-              var data=new Uint8Array(an.fftSize),hot=0;
+              var data=new Uint8Array(an.fftSize),hot=0,bt0=Date.now();
               bargeT=setInterval(function(){
                 if(document.body.className!=='speak'){clearInterval(bargeT);bargeT=null;try{bctx.close();}catch(e){}return;}
+                if(Date.now()-bt0<900){return;} /* grace period: ignore playback onset echo */
                 an.getByteTimeDomainData(data);
                 var m=0;for(var i=0;i<data.length;i++){var v=Math.abs(data[i]-128);if(v>m){m=v;}}
-                if(m>17){hot+=90;}else{hot=0;}
-                if(hot>=360){ /* sustained voice -> interrupt and listen */
+                if(m>26){hot+=90;}else{hot=0;} /* louder + sustained speech only, echo stays below this */
+                if(hot>=720){ /* sustained voice -> interrupt and listen */
                   clearInterval(bargeT);bargeT=null;try{bctx.close();}catch(e){}
                   stopVoice();toast('Interrupted — listening, Boss.');
                   if(SR&&!SRbroken){startSR();}else if(srvSTT){startRec();}
@@ -1495,10 +1553,12 @@ jobs:
             lastReply=t;
             if(!el('voice').checked){after();return;}
             if(elTTS){setState('speak','SPEAKING');
-              fetch('/tts',{method:'POST',headers:{'Content-Type':'application/json','X-Token':tok},body:JSON.stringify({text:clean(t).slice(0,1200)})})
+              var ctl=('AbortController' in window)?new AbortController():null;
+              var tto=ctl?setTimeout(function(){ctl.abort();},12000):null;
+              fetch('/tts',{method:'POST',headers:{'Content-Type':'application/json','X-Token':tok},body:JSON.stringify({text:clean(t).slice(0,1200),voice:curVoice()}),signal:ctl?ctl.signal:undefined})
               .then(function(r){if(!r.ok){throw new Error('tts');}return r.blob();})
-              .then(function(b){if(lastAudioURL){try{URL.revokeObjectURL(lastAudioURL);}catch(e){}}lastAudioURL=URL.createObjectURL(b);playUrl(lastAudioURL);})
-              .catch(function(){browserSpeak(t);});
+              .then(function(b){if(tto){clearTimeout(tto);}if(lastAudioURL){try{URL.revokeObjectURL(lastAudioURL);}catch(e){}}lastAudioURL=URL.createObjectURL(b);playUrl(lastAudioURL);})
+              .catch(function(){if(tto){clearTimeout(tto);}browserSpeak(t);});
             }else{browserSpeak(t);}
           }
           function stopVoice(){
@@ -1591,14 +1651,50 @@ jobs:
           </body></html>
           HUDHTML
           cat > /tmp/jarvis/app.py <<'PYJARVIS'
-          import os, re, signal, subprocess, threading, time, uuid
+          import asyncio, os, re, signal, subprocess, threading, time, uuid
           import requests as rq
           from flask import Flask, request, jsonify, Response
           from werkzeug.utils import secure_filename
 
           TOKEN = os.environ.get("PANEL_TOKEN", "hermes99")
           GROQ = os.environ.get("GROQ_API_KEY", "").strip()
-          VOICE_ID = "pNInz6obpgDQGcFmaJgB"
+          try:
+              import edge_tts
+              EDGE = True
+          except Exception:
+              EDGE = False
+
+          S_EN = "Hello Boss. This is my voice. I am online and ready for your orders."
+          S_BN = "\u09a8\u09ae\u09b8\u09cd\u0995\u09be\u09b0 \u09ac\u09b8\u0964 \u098f\u099f\u09be \u0986\u09ae\u09be\u09b0 \u0995\u09a3\u09cd\u09a0\u09b8\u09cd\u09ac\u09b0\u0964 \u0986\u09ae\u09bf \u0986\u09aa\u09a8\u09be\u09b0 \u09a8\u09bf\u09b0\u09cd\u09a6\u09c7\u09b6\u09c7\u09b0 \u099c\u09a8\u09cd\u09af \u09aa\u09cd\u09b0\u09b8\u09cd\u09a4\u09c1\u09a4\u0964"
+          S_HI = "\u0928\u092e\u0938\u094d\u0924\u0947 \u092c\u0949\u0938\u0964 \u092f\u0939 \u092e\u0947\u0930\u0940 \u0906\u0935\u093e\u091c\u093c \u0939\u0948\u0964 \u092e\u0948\u0902 \u0906\u092a\u0915\u0947 \u0906\u0926\u0947\u0936 \u0915\u0947 \u0932\u093f\u090f \u0924\u0948\u092f\u093e\u0930 \u0939\u0942\u0901\u0964"
+          G_US = "ENGLISH \u00b7 UNITED STATES"
+          G_XX = "ENGLISH \u00b7 UK / AU / INDIA"
+          G_BN = "BANGLA \u00b7 \u09ac\u09be\u0982\u09b2\u09be"
+          G_HI = "HINDI \u00b7 \u0939\u093f\u0928\u094d\u0926\u0940"
+          VOICES = [
+              {"id": "en-US-GuyNeural", "name": "Guy", "meta": "Male \u00b7 warm narrator", "group": G_US, "sample": S_EN},
+              {"id": "en-US-ChristopherNeural", "name": "Christopher", "meta": "Male \u00b7 deep, calm", "group": G_US, "sample": S_EN},
+              {"id": "en-US-EricNeural", "name": "Eric", "meta": "Male \u00b7 crisp assistant", "group": G_US, "sample": S_EN},
+              {"id": "en-US-AndrewMultilingualNeural", "name": "Andrew", "meta": "Male \u00b7 natural, multilingual", "group": G_US, "sample": S_EN},
+              {"id": "en-US-BrianMultilingualNeural", "name": "Brian", "meta": "Male \u00b7 smooth, multilingual", "group": G_US, "sample": S_EN},
+              {"id": "en-US-JennyNeural", "name": "Jenny", "meta": "Female \u00b7 friendly assistant", "group": G_US, "sample": S_EN},
+              {"id": "en-US-AriaNeural", "name": "Aria", "meta": "Female \u00b7 clear newsreader", "group": G_US, "sample": S_EN},
+              {"id": "en-US-AvaMultilingualNeural", "name": "Ava", "meta": "Female \u00b7 expressive, multilingual", "group": G_US, "sample": S_EN},
+              {"id": "en-GB-RyanNeural", "name": "Ryan", "meta": "Male \u00b7 British butler vibe", "group": G_XX, "sample": S_EN},
+              {"id": "en-GB-ThomasNeural", "name": "Thomas", "meta": "Male \u00b7 refined British", "group": G_XX, "sample": S_EN},
+              {"id": "en-GB-SoniaNeural", "name": "Sonia", "meta": "Female \u00b7 British", "group": G_XX, "sample": S_EN},
+              {"id": "en-AU-WilliamNeural", "name": "William", "meta": "Male \u00b7 Australian", "group": G_XX, "sample": S_EN},
+              {"id": "en-IN-PrabhatNeural", "name": "Prabhat", "meta": "Male \u00b7 Indian English", "group": G_XX, "sample": S_EN},
+              {"id": "en-IN-NeerjaNeural", "name": "Neerja", "meta": "Female \u00b7 Indian English", "group": G_XX, "sample": S_EN},
+              {"id": "bn-BD-PradeepNeural", "name": "Pradeep", "meta": "Male \u00b7 Bangladesh", "group": G_BN, "sample": S_BN},
+              {"id": "bn-BD-NabanitaNeural", "name": "Nabanita", "meta": "Female \u00b7 Bangladesh", "group": G_BN, "sample": S_BN},
+              {"id": "bn-IN-BashkarNeural", "name": "Bashkar", "meta": "Male \u00b7 India", "group": G_BN, "sample": S_BN},
+              {"id": "bn-IN-TanishaaNeural", "name": "Tanishaa", "meta": "Female \u00b7 India", "group": G_BN, "sample": S_BN},
+              {"id": "hi-IN-MadhurNeural", "name": "Madhur", "meta": "Male \u00b7 Hindi", "group": G_HI, "sample": S_HI},
+              {"id": "hi-IN-SwaraNeural", "name": "Swara", "meta": "Female \u00b7 Hindi", "group": G_HI, "sample": S_HI},
+          ]
+          VOICE_IDS = set(v["id"] for v in VOICES)
+          DEFAULT_VOICES = {"en-US": "en-US-GuyNeural", "bn-BD": "bn-BD-PradeepNeural", "hi-IN": "hi-IN-MadhurNeural"}
           UPLOAD_DIR = os.path.expanduser("~/.hermes/work/uploads")
           app = Flask(__name__)
           app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024   # 200 MB uploads
@@ -1618,18 +1714,28 @@ jobs:
                   ks = [k.strip() for k in os.environ.get("ELEVENLABS_KEYS", "").splitlines() if k.strip()]
               return ks
 
-          def el_tts(text):
-              for k in el_keys():
+          def edge_speak(text, voice):
+              # Free Microsoft Edge neural TTS - no API key needed.
+              if not EDGE:
+                  return None
+              if voice not in VOICE_IDS:
+                  voice = DEFAULT_VOICES["en-US"]
+
+              async def _gen():
+                  buf = b""
+                  com = edge_tts.Communicate(text[:2500], voice)
+                  async for ch in com.stream():
+                      if ch["type"] == "audio":
+                          buf += ch["data"]
+                  return buf
+
+              for _ in range(2):
                   try:
-                      r = rq.post("https://api.elevenlabs.io/v1/text-to-speech/" + VOICE_ID,
-                                  params={"output_format": "mp3_44100_128"},
-                                  headers={"xi-api-key": k},
-                                  json={"text": text[:2500], "model_id": "eleven_multilingual_v2"},
-                                  timeout=60)
-                      if r.status_code == 200 and r.content:
-                          return r.content
+                      audio = asyncio.run(_gen())
+                      if audio:
+                          return audio
                   except Exception:
-                      pass
+                      time.sleep(0.4)
               return None
 
           def do_stt(blob, mime, lang):
@@ -1733,16 +1839,18 @@ jobs:
           def config():
               if request.headers.get("X-Token", "") != TOKEN:
                   return jsonify(error="bad token"), 401
-              return jsonify(tts=bool(el_keys()), stt=bool(GROQ) or bool(el_keys()))
+              return jsonify(tts=EDGE, stt=bool(GROQ) or bool(el_keys()),
+                             voices=VOICES, defaults=DEFAULT_VOICES)
 
           @app.route("/tts", methods=["POST"])
           def tts_route():
               if request.headers.get("X-Token", "") != TOKEN:
                   return jsonify(error="bad token"), 401
-              text = ((request.get_json(silent=True) or {}).get("text") or "").strip()
+              data = request.get_json(silent=True) or {}
+              text = (data.get("text") or "").strip()
               if not text:
                   return jsonify(error="empty"), 400
-              audio = el_tts(text)
+              audio = edge_speak(text, (data.get("voice") or "").strip())
               if audio:
                   return Response(audio, mimetype="audio/mpeg")
               return jsonify(error="tts unavailable"), 503
@@ -1831,7 +1939,7 @@ jobs:
 
           app.run(host="0.0.0.0", port=7777, threaded=True)
           PYJARVIS
-          pip install -q flask requests || true
+          pip install -q flask requests edge-tts || true
           nohup python3 /tmp/jarvis/app.py > /tmp/jarvis.log 2>&1 &
           sleep 2
           curl -fs http://localhost:7777/ >/dev/null || { echo '::warning::Agent HUD failed to start'; cat /tmp/jarvis.log; }
@@ -1844,6 +1952,8 @@ jobs:
           done
           echo "JARVIS_URL=$JARVIS_URL" >> "$GITHUB_ENV"
           echo "::notice title=🤖 Agent HUD::${JARVIS_URL:-tunnel failed}"
+
+
 
 
       # ── 11. Background backup loop (every 30 min -> backup branch) ──
