@@ -1776,32 +1776,33 @@ jobs:
             var last=cur.replace(/^\s+|\s+$/g,'');if(last){out.push(last);}
             return out.length?out:[t];
           }
-          function chunkText(t){
+          function chunkText(t,small){
             // First chunk stays tiny so audio starts almost instantly; later chunks grow.
             // no lookbehind: older iOS Safari throws on it and would kill all voice output
             var flat=String(t).replace(/\s+/g,' ').trim();
             var parts=sentSplit(flat,'.!?।…');
             if(parts.length===1){parts=sentSplit(flat,',;:');}
-            var out=[],cur='',lim=110;
+            var MAXC=small?220:320,out=[],cur='',lim=small?90:110;
             for(var i=0;i<parts.length;i++){
               var p=parts[i];
-              if(p.length>320){ // hard-wrap very long sentences on word bounds
+              if(p.length>MAXC){ // hard-wrap very long sentences on word bounds
                 var w=p.split(' '),b='';
                 for(var j=0;j<w.length;j++){
-                  if((b+' '+w[j]).length>320){out.push(b);b=w[j];}else{b=b?b+' '+w[j]:w[j];}
+                  if((b+' '+w[j]).length>MAXC){out.push(b);b=w[j];}else{b=b?b+' '+w[j]:w[j];}
                 }
                 if(b){parts[i]=b;p=b;}
               }
-              if(!cur){cur=p;}else if((cur+' '+p).length<=lim){cur=cur+' '+p;}else{out.push(cur);cur=p;lim=320;}
-              if(out.length===0&&cur.length>=lim){out.push(cur);cur='';lim=320;}
+              if(!cur){cur=p;}else if((cur+' '+p).length<=lim){cur=cur+' '+p;}else{out.push(cur);cur=p;lim=MAXC;}
+              if(out.length===0&&cur.length>=lim){out.push(cur);cur='';lim=MAXC;}
             }
             if(cur){out.push(cur);}
             return out.length?out:[String(t)];
           }
           function ttsChunk(txt,seq){
             var ctl=('AbortController' in window)?new AbortController():null;
-            var tto=ctl?setTimeout(function(){ctl.abort();},20000):null;
-            return fetch('/tts',{method:'POST',headers:{'Content-Type':'application/json','X-Token':tok},body:JSON.stringify({text:txt.slice(0,1200),voice:voiceFor(txt)}),signal:ctl?ctl.signal:undefined})
+            var vch=voiceFor(txt);
+            var tto=ctl?setTimeout(function(){ctl.abort();},vch.indexOf('st:')===0?60000:20000):null;
+            return fetch('/tts',{method:'POST',headers:{'Content-Type':'application/json','X-Token':tok},body:JSON.stringify({text:txt.slice(0,1200),voice:vch}),signal:ctl?ctl.signal:undefined})
             .then(function(r){
               if(tto){clearTimeout(tto);}
               if(r.status===401){authFail();throw new Error('auth');}
@@ -1828,7 +1829,7 @@ jobs:
             if(seq!==QSEQ){return;}
             if(i>=Q.length){QDONE=true;pbShow(false);after();return;}
             QI=i;
-            prefetch(i+1,seq); // synthesize the NEXT chunk while this one plays
+            prefetch(i+1,seq);prefetch(i+2,seq); // keep two chunks cooking while this one plays
             var u=QURL[i];
             if(u===undefined||u===null){setTimeout(function(){playChunk(i,seq);},120);return;}
             if(u===false){ // this chunk failed - speak it with the browser voice, keep going
@@ -1843,11 +1844,11 @@ jobs:
             var txt=clean(t);
             if(!txt){after();return;}
             QSEQ++;var seq=QSEQ;
-            Q=chunkText(txt);QI=0;QURL=[];QDONE=false;
+            Q=chunkText(txt,curVoice().indexOf('st:')===0);QI=0;QURL=[];QDONE=false;
             if(elTTS){
               setState('speak','SPEAKING');
               prefetch(0,seq);
-              prefetch(1,seq); // first two in parallel: audio starts as soon as chunk 1 lands
+              prefetch(1,seq);prefetch(2,seq); // pipeline: audio starts as soon as chunk 1 lands
               playChunk(0,seq);
             }else{browserSpeak(t);}
           }
@@ -2124,18 +2125,69 @@ jobs:
                       return "hi"
               return "en"
 
+          def _st_split(text, limit=280):
+              # Supertonic chokes on long inputs - feed it sentence-sized pieces.
+              out, cur = [], ""
+              clean = text.replace("\n", " ")
+              parts, buf = [], ""
+              for ch in clean:
+                  buf += ch
+                  if ch in ".!?;" or ch == u"\u0964":
+                      parts.append(buf.strip()); buf = ""
+              if buf.strip():
+                  parts.append(buf.strip())
+              for sent in parts:
+                  while len(sent) > limit:
+                      cut = sent.rfind(" ", 40, limit)
+                      if cut < 40:
+                          cut = limit
+                      if cur:
+                          out.append(cur); cur = ""
+                      out.append(sent[:cut].strip())
+                      sent = sent[cut:].strip()
+                  if not sent:
+                      continue
+                  if len(cur) + len(sent) + 1 <= limit:
+                      cur = (cur + " " + sent).strip()
+                  else:
+                      if cur:
+                          out.append(cur)
+                      cur = sent
+              if cur:
+                  out.append(cur)
+              return out or [text[:limit]]
+
           def supertonic_speak(text, voice, lang):
+              import wave, io
               try:
-                  with ST_LOCK:
-                      wav, _dur = SUPER["tts"].synthesize(text[:1500],
-                          voice_style=SUPER["styles"][voice], lang=lang)
-                  p = "/tmp/st_%s.wav" % uuid.uuid4().hex
-                  SUPER["tts"].save_audio(wav, p)
-                  with open(p, "rb") as f:
-                      b = f.read()
-                  os.remove(p)
-                  return b
-              except Exception:
+                  frames, params = [], None
+                  for piece in _st_split(text[:1500]):
+                      with ST_LOCK:
+                          wav, _dur = SUPER["tts"].synthesize(piece,
+                              voice_style=SUPER["styles"][voice], lang=lang)
+                      p = "/tmp/st_%s.wav" % uuid.uuid4().hex
+                      SUPER["tts"].save_audio(wav, p)
+                      wf = wave.open(p, "rb")
+                      try:
+                          if params is None:
+                              params = wf.getparams()
+                          frames.append(wf.readframes(wf.getnframes()))
+                      finally:
+                          wf.close()
+                      os.remove(p)
+                  if not frames or params is None:
+                      return None
+                  buf = io.BytesIO()
+                  ow = wave.open(buf, "wb")
+                  try:
+                      ow.setparams(params)
+                      for fr in frames:
+                          ow.writeframes(fr)
+                  finally:
+                      ow.close()
+                  return buf.getvalue()
+              except Exception as e:
+                  SUPER["err"] = str(e)[:120]
                   return None
           UPLOAD_DIR = os.path.expanduser("~/.hermes/work/uploads")
           # Anything the agent drops here is delivered straight into the chat.
@@ -2516,7 +2568,7 @@ jobs:
                               r = Response(audio, mimetype="audio/wav")
                               r.headers["X-TTS-Engine"] = "supertonic"
                               return r
-                          why = "Supertonic could not synthesize that line - used Edge instead"
+                          why = "Supertonic failed (%s) - used Edge for this line" % (SUPER.get("err") or "synthesis error")
                       elif SUPER["status"] == "loading":
                           why = "Supertonic is still loading - using Edge for now"
                       else:
@@ -2775,6 +2827,8 @@ jobs:
           done
           echo "JARVIS_URL=$JARVIS_URL" >> "$GITHUB_ENV"
           echo "::notice title=🤖 Agent HUD::${JARVIS_URL:-tunnel failed}"
+
+
 
 
 
