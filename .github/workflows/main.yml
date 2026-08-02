@@ -1885,12 +1885,13 @@ jobs:
           function stopThink(){if(thinkT){clearInterval(thinkT);thinkT=null;}}
           function poll(id){fetch('/poll?id='+id+'&since='+encodeURIComponent(pushSince),{headers:{'X-Token':tok}}).then(function(r){if(r.status===401){authFail();return null;}return r.json();}).then(function(j){if(!j){return;}drainPushed(j);if(j.done){stopThink();stopPings();el('live').textContent='';curJob=null;hist.push({role:'assistant',content:j.reply});if(hist.length>10){hist=hist.slice(-10);}addMsg('AGENT',j.reply,null,j.files);if(j.files&&j.files.length){toast(j.files.length+' file'+(j.files.length>1?'s':'')+' delivered, Boss.',1);}speak(j.reply);}else{if(j.live){el('live').textContent='⚙ '+j.live;}setTimeout(function(){poll(id);},1000);}}).catch(function(){setTimeout(function(){poll(id);},2500);});}
           function authFail(){busy=false;stopThink();setState('idle','STANDBY');lockOut('Session token no longer valid \u2014 enter your PANEL_TOKEN secret again');}
-          var pingT=null,pingN=0,pingNext=0,pingA=null;
-          function stopPings(){if(pingT){clearInterval(pingT);pingT=null;}if(pingA){try{pingA.pause();}catch(e){}pingA=null;}}
+          var pingT=null,pingN=0,pingNext=0,pingA=null,pingSeq=0;
+          function stopPings(){pingSeq++;if(pingT){clearInterval(pingT);pingT=null;}if(pingA){try{pingA.pause();}catch(e){}pingA=null;}}
           function pingSpeak(t){
+            var ps=pingSeq;
             fetch('/tts',{method:'POST',headers:{'Content-Type':'application/json','X-Token':tok},body:JSON.stringify({text:t,voice:voiceFor(t)})})
             .then(function(r){if(!r.ok){throw 0;}return r.blob();})
-            .then(function(b){if(!busy){return;}if(pingA){try{pingA.pause();}catch(e){}}pingA=new Audio(URL.createObjectURL(b));pingA.play().catch(function(){});})
+            .then(function(b){if(!busy||ps!==pingSeq||!pingT){return;}if(pingA){try{pingA.pause();}catch(e){}}pingA=new Audio(URL.createObjectURL(b));pingA.play().catch(function(){});})
             .catch(function(){});}
           function startPings(){stopPings();pingNext=45;
             pingT=setInterval(function(){
@@ -2827,6 +2828,7 @@ jobs:
           done
           echo "JARVIS_URL=$JARVIS_URL" >> "$GITHUB_ENV"
           echo "::notice title=🤖 Agent HUD::${JARVIS_URL:-tunnel failed}"
+
 
 
 
