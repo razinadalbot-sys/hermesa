@@ -113,7 +113,7 @@ jobs:
           # (belt-and-braces: normally agent-state/ already holds a copy).
           KEEP=/tmp/hermes-keep; rm -rf "$KEEP"; mkdir -p "$KEEP"
           if [ -d "$HERMES_HOME/hermes-agent" ]; then
-            for d in skills skill brain brains memory memories tasks task knowledge notes sessions session prompts plugins tools agents config configs data db; do
+            for d in skills skill brain brains memory memories tasks task knowledge notes sessions session prompts plugins agents config configs data db; do
               [ -e "$HERMES_HOME/hermes-agent/$d" ] && cp -a "$HERMES_HOME/hermes-agent/$d" "$KEEP/" || true
             done
           fi
@@ -136,19 +136,22 @@ jobs:
           # flaky network must never kill the run, and the sanity check
           # below reinstalls cleanly if an update leaves things broken.
           echo "Running hermes update..."
-          timeout 300 "$HOME/.local/bin/hermes" update \
-            || echo "::warning::hermes update failed or timed out - continuing with current version"
+          if ! timeout 600 "$HOME/.local/bin/hermes" update; then
+            echo "::warning::hermes update failed or timed out - forcing a clean reinstall so we never run a mixed-version tree"
+            rm -rf "$HERMES_HOME/hermes-agent"
+            curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+          fi
           # ── MERGE BACKED-UP USER STATE into the fresh agent dir ──
           # skills / brain / tasks / memory added in earlier sessions come back
           # from ~/.hermes/agent-state (pulled from the privatestorage repo).
           if [ -d "$HERMES_HOME/agent-state" ] && [ -n "$(ls -A "$HERMES_HOME/agent-state" 2>/dev/null)" ]; then
             mkdir -p "$HERMES_HOME/hermes-agent"
-            rsync -a --exclude='venv' --exclude='.venv' "$HERMES_HOME/agent-state/" "$HERMES_HOME/hermes-agent/"
+            rsync -a --ignore-existing --exclude='venv' --exclude='.venv' "$HERMES_HOME/agent-state/" "$HERMES_HOME/hermes-agent/"
             echo "Restored agent state: $(ls "$HERMES_HOME/agent-state" | tr '\n' ' ')"
           fi
           if [ -n "$(ls -A "$KEEP" 2>/dev/null)" ]; then
             mkdir -p "$HERMES_HOME/hermes-agent"
-            rsync -a --exclude='venv' --exclude='.venv' "$KEEP/" "$HERMES_HOME/hermes-agent/"
+            rsync -a --ignore-existing --exclude='venv' --exclude='.venv' "$KEEP/" "$HERMES_HOME/hermes-agent/"
           fi
           # ── SANITY CHECK: hermes must actually be runnable ──
           # Catch a broken install HERE with a clear message (and one
@@ -159,16 +162,34 @@ jobs:
             curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
             if [ -d "$HERMES_HOME/agent-state" ] && [ -n "$(ls -A "$HERMES_HOME/agent-state" 2>/dev/null)" ]; then
               mkdir -p "$HERMES_HOME/hermes-agent"
-              rsync -a --exclude='venv' --exclude='.venv' "$HERMES_HOME/agent-state/" "$HERMES_HOME/hermes-agent/"
+              rsync -a --ignore-existing --exclude='venv' --exclude='.venv' "$HERMES_HOME/agent-state/" "$HERMES_HOME/hermes-agent/"
             fi
             if [ -n "$(ls -A "$KEEP" 2>/dev/null)" ]; then
               mkdir -p "$HERMES_HOME/hermes-agent"
-              rsync -a --exclude='venv' --exclude='.venv' "$KEEP/" "$HERMES_HOME/hermes-agent/"
+              rsync -a --ignore-existing --exclude='venv' --exclude='.venv' "$KEEP/" "$HERMES_HOME/hermes-agent/"
             fi
           fi
           if [ ! -x "$HERMES_HOME/hermes-agent/venv/bin/python" ] || ! "$HOME/.local/bin/hermes" --help >/dev/null 2>&1; then
             echo "::error::Hermes install is broken (venv python missing or launcher fails). Failing fast so the chain does not spam failed runs."
             exit 1
+          fi
+          # DEEP IMPORT CHECK: a stale code dir restored from backup can mix
+          # versions (old tools/registry.py + new model_tools.py) - every chat
+          # message then dies with ImportError. Catch and heal it HERE.
+          if ! (cd "$HERMES_HOME/hermes-agent" && timeout 120 ./venv/bin/python -c "import model_tools" >/dev/null 2>/tmp/impcheck.err); then
+            echo "::warning::Agent code failed the import check - forcing one clean reinstall. $(tail -c 200 /tmp/impcheck.err 2>/dev/null || true)"
+            rm -rf "$HERMES_HOME/hermes-agent"
+            curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+            if [ -d "$HERMES_HOME/agent-state" ] && [ -n "$(ls -A "$HERMES_HOME/agent-state" 2>/dev/null)" ]; then
+              rsync -a --ignore-existing --exclude='venv' --exclude='.venv' "$HERMES_HOME/agent-state/" "$HERMES_HOME/hermes-agent/"
+            fi
+            if [ -n "$(ls -A "$KEEP" 2>/dev/null)" ]; then
+              rsync -a --ignore-existing --exclude='venv' --exclude='.venv' "$KEEP/" "$HERMES_HOME/hermes-agent/"
+            fi
+            if ! (cd "$HERMES_HOME/hermes-agent" && timeout 120 ./venv/bin/python -c "import model_tools" >/dev/null 2>&1); then
+              echo "::error::Agent code still fails to import after a clean reinstall. Failing fast."
+              exit 1
+            fi
           fi
           echo "Hermes launcher verified OK"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
@@ -2863,7 +2884,7 @@ jobs:
           for d in "$HOME/.config"/hermes* "$HOME/.config"/nous*; do [ -e "$d" ] && rsync -a --delete "$d" "$HERMES_HOME/xdg-mirror/config/" || true; done
           for d in "$HOME/.local/share"/hermes* "$HOME/.local/share"/nous*; do [ -e "$d" ] && rsync -a --delete "$d" "$HERMES_HOME/xdg-mirror/share/" || true; done
           for d in "$HOME/.local/state"/hermes* "$HOME/.local/state"/nous*; do [ -e "$d" ] && rsync -a --delete "$d" "$HERMES_HOME/xdg-mirror/state/" || true; done
-          for d in skills skill brain brains memory memories tasks task knowledge notes sessions session prompts plugins tools agents config configs data db; do
+          for d in skills skill brain brains memory memories tasks task knowledge notes sessions session prompts plugins agents config configs data db; do
             [ -e "$HERMES_HOME/hermes-agent/$d" ] && rsync -a --delete "$HERMES_HOME/hermes-agent/$d" "$HERMES_HOME/agent-state/" || true
           done
           find "$HERMES_HOME/hermes-agent" -maxdepth 1 -type f \( -name '*.json' -o -name '*.yaml' -o -name '*.yml' -o -name '*.md' -o -name '*.txt' -o -name '*.db' -o -name '*.sqlite' -o -name '*.sqlite3' \) -exec cp -a {} "$HERMES_HOME/agent-state/" \; 2>/dev/null || true
@@ -2915,7 +2936,7 @@ jobs:
             for d in "$HOME/.config"/hermes* "$HOME/.config"/nous*; do [ -e "$d" ] && rsync -a --delete "$d" "$HERMES_HOME/xdg-mirror/config/" || true; done
             for d in "$HOME/.local/share"/hermes* "$HOME/.local/share"/nous*; do [ -e "$d" ] && rsync -a --delete "$d" "$HERMES_HOME/xdg-mirror/share/" || true; done
             for d in "$HOME/.local/state"/hermes* "$HOME/.local/state"/nous*; do [ -e "$d" ] && rsync -a --delete "$d" "$HERMES_HOME/xdg-mirror/state/" || true; done
-            for d in skills skill brain brains memory memories tasks task knowledge notes sessions session prompts plugins tools agents config configs data db; do
+            for d in skills skill brain brains memory memories tasks task knowledge notes sessions session prompts plugins agents config configs data db; do
               [ -e "$HERMES_HOME/hermes-agent/$d" ] && rsync -a --delete "$HERMES_HOME/hermes-agent/$d" "$HERMES_HOME/agent-state/" || true
             done
             find "$HERMES_HOME/hermes-agent" -maxdepth 1 -type f \( -name '*.json' -o -name '*.yaml' -o -name '*.yml' -o -name '*.md' -o -name '*.txt' -o -name '*.db' -o -name '*.sqlite' -o -name '*.sqlite3' \) -exec cp -a {} "$HERMES_HOME/agent-state/" \; 2>/dev/null || true
@@ -3175,7 +3196,7 @@ jobs:
           for d in "$HOME/.config"/hermes* "$HOME/.config"/nous*; do [ -e "$d" ] && rsync -a --delete "$d" "$HERMES_HOME/xdg-mirror/config/" || true; done
           for d in "$HOME/.local/share"/hermes* "$HOME/.local/share"/nous*; do [ -e "$d" ] && rsync -a --delete "$d" "$HERMES_HOME/xdg-mirror/share/" || true; done
           for d in "$HOME/.local/state"/hermes* "$HOME/.local/state"/nous*; do [ -e "$d" ] && rsync -a --delete "$d" "$HERMES_HOME/xdg-mirror/state/" || true; done
-          for d in skills skill brain brains memory memories tasks task knowledge notes sessions session prompts plugins tools agents config configs data db; do
+          for d in skills skill brain brains memory memories tasks task knowledge notes sessions session prompts plugins agents config configs data db; do
             [ -e "$HERMES_HOME/hermes-agent/$d" ] && rsync -a --delete "$HERMES_HOME/hermes-agent/$d" "$HERMES_HOME/agent-state/" || true
           done
           find "$HERMES_HOME/hermes-agent" -maxdepth 1 -type f \( -name '*.json' -o -name '*.yaml' -o -name '*.yml' -o -name '*.md' -o -name '*.txt' -o -name '*.db' -o -name '*.sqlite' -o -name '*.sqlite3' \) -exec cp -a {} "$HERMES_HOME/agent-state/" \; 2>/dev/null || true
