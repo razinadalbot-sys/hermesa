@@ -933,7 +933,7 @@ jobs:
           if [ "$bad_n" -gt 0 ]; then
             curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
               -d chat_id="${TELEGRAM_USER_ID}" \
-              -d text="🚨 Hermes: ${bad_n} NVIDIA key(s) dead (auth failed) - ${n} still working" > /dev/null || true
+              --data-urlencode text="🚨 Hermes: ${bad_n} NVIDIA key(s) dead (auth failed) - ${n} still working" > /dev/null || true
           fi
           if [ "$n" -eq 0 ]; then
             echo "::error::No working NVIDIA key — secret is empty or every key failed the auth check"
@@ -960,7 +960,7 @@ jobs:
           if [ "$bad_m" -gt 0 ]; then
             curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
               -d chat_id="${TELEGRAM_USER_ID}" \
-              -d text="🚨 Hermes: ${bad_m} Mistral key(s) dead (auth failed) - ${m} still working" > /dev/null || true
+              --data-urlencode text="🚨 Hermes: ${bad_m} Mistral key(s) dead (auth failed) - ${m} still working" > /dev/null || true
           fi
 
           # make the split keys visible to this shell + panel process
@@ -996,7 +996,7 @@ jobs:
             TG_API="https://api.telegram.org"
             curl -s -X POST "${TG_API}/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
               -d chat_id="${TELEGRAM_USER_ID}" \
-              -d text="⚠️ No model pool selected yet. Open the panel, tick your models and press Apply: ${PANEL_URL} (password = PANEL_TOKEN secret). Waiting up to 60 min..." > /dev/null || true
+              --data-urlencode text="⚠️ No model pool selected yet. Open the panel, tick your models and press Apply: ${PANEL_URL} (password = PANEL_TOKEN secret). Waiting up to 60 min..." > /dev/null || true
             for i in $(seq 1 240); do
               pool_ok && break
               sleep 15
@@ -1012,7 +1012,7 @@ jobs:
             echo "::warning::All saved models are dead/EOL — pick a fresh pool: $PANEL_URL"
             curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
               -d chat_id="${TELEGRAM_USER_ID}" \
-              -d text="⚠️ All your saved models were retired by the provider — pool auto-cleaned. Open the panel and apply a fresh pool: ${PANEL_URL}" > /dev/null || true
+              --data-urlencode text="⚠️ All your saved models were retired by the provider — pool auto-cleaned. Open the panel and apply a fresh pool: ${PANEL_URL}" > /dev/null || true
             for i in $(seq 1 240); do
               pool_ok && break
               sleep 15
@@ -3059,17 +3059,23 @@ jobs:
           [ -n "$LIVEVIEW_URL" ] && LIVEVIEW_URL="${LIVEVIEW_URL}/vnc.html?autoconnect=1&resize=scale&reconnect=1"
           echo "::notice title=🔭 Live desktop view::${LIVEVIEW_URL:-tunnel failed}"
           TG_API="https://api.telegram.org"
-          curl -s -X POST "${TG_API}/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+          TG_RESP=$(curl -s -X POST "${TG_API}/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_USER_ID}" \
-            -d text="🟢 Hermes Agent ONLINE (Telegram + Slack, NVIDIA/Mistral pool)
+            --data-urlencode text="🟢 Hermes Agent ONLINE (Telegram + Slack, NVIDIA/Mistral pool)
+          🤖 Agent HUD: ${JARVIS_URL:-not available} (token: your PANEL_TOKEN)
           🎛️ Model panel: ${PANEL_URL}
           🖥️ Hermes WebUI: ${WEBUI_URL:-not available}
           📊 Dashboard: ${DASHBOARD_URL:-not available} (user: boss)
           ⏱ Run length: ${RUN_HOURS_INPUT:-5.5} hours
           🔭 Live desktop: ${LIVEVIEW_URL:-not available} (FULL control - pass: first 8 chars of PANEL_TOKEN)
-          🤖 Agent HUD: ${JARVIS_URL:-not available} (token: your PANEL_TOKEN)
           🔑 Password: your PANEL_TOKEN secret
-          Use /model in Telegram or !model in Slack to switch models" > /dev/null
+          Use /model in Telegram or !model in Slack to switch models")
+          case "$TG_RESP" in
+            *'"ok":true'*) echo "Start notification delivered to Telegram" ;;
+            *) echo "::warning::Telegram start notification FAILED - grab the links from the line below. Response: $(echo "$TG_RESP" | head -c 200)" ;;
+          esac
+          # belt-and-braces: links always land in this step log too
+          echo "LINKS: hud=${JARVIS_URL:-n/a} | model=${PANEL_URL:-n/a} | webui=${WEBUI_URL:-n/a} | dashboard=${DASHBOARD_URL:-n/a} | live=${LIVEVIEW_URL:-n/a}"
 
       # ── 13. Run gateway with time budget + anti-stuck watchdog ──
       - name: Run Hermes gateway
@@ -3311,4 +3317,4 @@ jobs:
           TG_API="https://api.telegram.org"
           curl -s -X POST "${TG_API}/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_USER_ID}" \
-            -d text="🔴 Hermes Agent run FAILED — check Actions logs" > /dev/null
+            --data-urlencode text="🔴 Hermes Agent run FAILED — check Actions logs" > /dev/null
