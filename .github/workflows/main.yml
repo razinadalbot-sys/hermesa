@@ -2,6 +2,11 @@ name: Hermes Agent — Telegram + Slack + NVIDIA/Mistral Pool
 
 on:
   workflow_dispatch:
+    inputs:
+      run_hours:
+        description: "Run duration in HOURS (e.g. 0.5, 1, 3). Leave empty for the full 5.5h"
+        required: false
+        default: ""
 
 # actions:write lets the last step dispatch the NEXT run (24/7 chaining)
 # using the built-in GITHUB_TOKEN - no extra secret needed.
@@ -15,6 +20,8 @@ concurrency:
 
 env:
   RUN_MINUTES: 330
+  # optional manual-run override, raw hours string (may be empty)
+  RUN_HOURS_INPUT: ${{ github.event.inputs.run_hours }}
   HERMES_HOME: /home/runner/.hermes
   DATA_REPO: jahid12525/harmesprivatestorage
 
@@ -227,7 +234,7 @@ jobs:
         run: |
           # Shared virtual display :99 — the browser AND all the agent's GUI
           # work render here, so the LIVE VIEW (below) shows everything.
-          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb x11vnc novnc websockify fluxbox xterm
+          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb x11vnc novnc websockify fluxbox xterm pcmanfm mousepad
           Xvfb :99 -screen 0 1920x1080x24 > /tmp/xvfb99.log 2>&1 &
           sleep 2
           export DISPLAY=:99
@@ -236,6 +243,17 @@ jobs:
           # the live view. Fluxbox = real desktop (background, taskbar, window
           # titlebars), and the status xterm keeps something moving on screen
           # at all times so you can SEE the machine is alive.
+          # Right-click launcher menu for manual work (file manager, terminal,
+          # editor). Fluxbox reads it at startup, so write it BEFORE starting.
+          mkdir -p "$HOME/.fluxbox"
+          cat > "$HOME/.fluxbox/menu" <<'EOF'
+          [begin] (Hermes Desktop)
+            [exec] (File Manager) {pcmanfm}
+            [exec] (Terminal) {xterm -fg white -bg black -geometry 110x28}
+            [exec] (Text Editor) {mousepad}
+            [restart] (Restart Fluxbox)
+          [end]
+          EOF
           fluxbox > /tmp/fluxbox.log 2>&1 &
           sleep 1
           cat > /tmp/status.sh <<'EOF'
@@ -301,9 +319,11 @@ jobs:
           # ── LIVE DESKTOP VIEW: watch the agent work, from your browser ──
           # x11vnc mirrors display :99, noVNC serves a browser-based viewer on
           # port 6080 (tunnel + link are added in the Notify start step).
-          # View-only + password so nobody can hijack the desktop. NOTE: VNC
+          # FULL CONTROL: your mouse + keyboard work in the view, so you can
+          # step in for manual tasks (login pages, captchas, tweaks). Still
+          # password-gated so nobody else can hijack the desktop. NOTE: VNC
           # passwords only use the FIRST 8 characters of PANEL_TOKEN.
-          x11vnc -display :99 -forever -shared -viewonly -bg -quiet \
+          x11vnc -display :99 -forever -shared -repeat -bg -quiet \
             -passwd "${PANEL_TOKEN:-hermes99}" -o /tmp/x11vnc.log
           nohup websockify --web=/usr/share/novnc 6080 localhost:5900 > /tmp/novnc.log 2>&1 &
           echo "Live desktop view server running on :6080"
@@ -1222,6 +1242,48 @@ jobs:
       # Every command runs the FULL Hermes agent via `hermes chat -q`.
       # Voice replies use FREE Microsoft Edge neural TTS (no key needed);
       # pick + preview voices in the VOICE MODEL panel. Protected by PANEL_TOKEN.
+      - name: Start Hermes Dashboard
+        run: |
+          # Official Nous management dashboard (settings, API keys, session
+          # monitor). Behind a public tunnel it MUST have auth: a non-loopback
+          # bind engages the built-in auth gate, and we feed it the bundled
+          # username/password provider (password = PANEL_TOKEN, like the rest).
+          # An auth-free loopback dashboard must NEVER be tunneled - it can
+          # read and write the .env secrets file.
+          DASH_SECRET=$(openssl rand -base64 32)
+          {
+            echo "HERMES_DASHBOARD_BASIC_AUTH_USERNAME=boss"
+            echo "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=${PANEL_TOKEN}"
+            echo "HERMES_DASHBOARD_BASIC_AUTH_SECRET=${DASH_SECRET}"
+          } >> "$HERMES_HOME/.env"
+          chmod 600 "$HERMES_HOME/.env" || true
+          nohup "$HOME/.local/bin/hermes" dashboard --no-open --host 0.0.0.0 --port 9119 \
+            > /tmp/dashboard.log 2>&1 &
+          ok=0
+          for i in $(seq 1 20); do
+            curl -fs http://localhost:9119/api/status >/dev/null 2>&1 && { ok=1; break; }
+            sleep 3
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "::warning::Hermes dashboard did not come up - skipping it this run"
+            tail -n 30 /tmp/dashboard.log 2>/dev/null || true
+            exit 0
+          fi
+          nohup cloudflared tunnel --no-autoupdate --url http://localhost:9119 > /tmp/dash-tunnel.log 2>&1 &
+          DASHBOARD_URL=""
+          for i in $(seq 1 30); do
+            DASHBOARD_URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/dash-tunnel.log | head -n1 || true)
+            [ -n "$DASHBOARD_URL" ] && break
+            sleep 2
+          done
+          if [ -z "$DASHBOARD_URL" ]; then
+            echo "::warning::Dashboard tunnel failed - dashboard only reachable inside the runner"
+            exit 0
+          fi
+          echo "DASHBOARD_URL=$DASHBOARD_URL" >> "$GITHUB_ENV"
+          echo "::notice title=Hermes Dashboard::$DASHBOARD_URL (user: boss / password = PANEL_TOKEN secret)"
+        env:
+          PANEL_TOKEN: ${{ secrets.PANEL_TOKEN }}
       - name: Start Agent HUD interface
         env:
           PANEL_TOKEN: ${{ secrets.PANEL_TOKEN }}
@@ -2994,7 +3056,7 @@ jobs:
             [ -n "$LIVEVIEW_URL" ] && break
             sleep 2
           done
-          [ -n "$LIVEVIEW_URL" ] && LIVEVIEW_URL="${LIVEVIEW_URL}/vnc.html"
+          [ -n "$LIVEVIEW_URL" ] && LIVEVIEW_URL="${LIVEVIEW_URL}/vnc.html?autoconnect=1&resize=scale&reconnect=1"
           echo "::notice title=🔭 Live desktop view::${LIVEVIEW_URL:-tunnel failed}"
           TG_API="https://api.telegram.org"
           curl -s -X POST "${TG_API}/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
@@ -3002,7 +3064,9 @@ jobs:
             -d text="🟢 Hermes Agent ONLINE (Telegram + Slack, NVIDIA/Mistral pool)
           🎛️ Model panel: ${PANEL_URL}
           🖥️ Hermes WebUI: ${WEBUI_URL:-not available}
-          🔭 Live desktop: ${LIVEVIEW_URL:-not available} (pass: first 8 chars of PANEL_TOKEN)
+          📊 Dashboard: ${DASHBOARD_URL:-not available} (user: boss)
+          ⏱ Run length: ${RUN_HOURS_INPUT:-5.5} hours
+          🔭 Live desktop: ${LIVEVIEW_URL:-not available} (FULL control - pass: first 8 chars of PANEL_TOKEN)
           🤖 Agent HUD: ${JARVIS_URL:-not available} (token: your PANEL_TOKEN)
           🔑 Password: your PANEL_TOKEN secret
           Use /model in Telegram or !model in Slack to switch models" > /dev/null
@@ -3137,6 +3201,13 @@ jobs:
           pkill -f "hermes gateway" >/dev/null 2>&1 || true
           sleep 2
 
+          # Manual run-hours input (short test runs). Clamped 6..345 min so a
+          # typo can neither instant-kill the run nor blow past the GitHub 6h
+          # job limit (job timeout-minutes: 350). Empty input = default 330.
+          if [ -n "$RUN_HOURS_INPUT" ]; then
+            RUN_MINUTES=$(awk -v h="$RUN_HOURS_INPUT" 'BEGIN{m=int(h*60+0.5); if(m<6)m=6; if(m>345)m=345; print m}')
+            echo "Manual duration selected: ${RUN_HOURS_INPUT}h -> ${RUN_MINUTES} minutes"
+          fi
           JOB_START=$(cat /tmp/job_start)
           END=$(( JOB_START + RUN_MINUTES * 60 ))
           while true; do
