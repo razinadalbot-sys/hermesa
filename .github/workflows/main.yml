@@ -275,20 +275,10 @@ jobs:
           chmod +x /tmp/status.sh
           xterm -geometry 130x20+30+30 -fg green -bg black -T "Hermes Agent — status" -e /tmp/status.sh &
 
-          # VISIBLE Chrome on :99 - kept for the user's MANUAL tasks in the
-          # live view and as a CDP fallback for the built-in browser tools
-          # if the Camofox anti-detect server (below) fails to start.
-          BROWSER_BIN=$(command -v google-chrome || command -v chromium-browser || command -v chromium || true)
-          if [ -n "$BROWSER_BIN" ]; then
-            mkdir -p "$HERMES_HOME/chrome-profile"
-            nohup "$BROWSER_BIN" --remote-debugging-port=9223 \
-              --user-data-dir="$HERMES_HOME/chrome-profile" \
-              --no-first-run --no-default-browser-check --disable-gpu \
-              --window-size=1600,900 about:blank > /tmp/chrome.log 2>&1 &
-            echo "Visible Chrome started on :99 (CDP port 9223)"
-          else
-            echo "::warning::No Chromium-family browser found — built-in browser tools will be headless"
-          fi
+          # Chrome is NOT started here by default anymore. Camofox is the
+          # browser; a visible Chrome launches ONLY as a fallback below, and
+          # ONLY if the Camofox server fails - so on a normal run NO browser
+          # window opens on the desktop by itself.
           pip install -U "camoufox[geoip]" pyvirtualdisplay pyautogui
           # fetch skips the ~200MB browser download when restored from cache
           python3 -m camoufox fetch
@@ -345,6 +335,24 @@ jobs:
             done
           fi
           [ -f /tmp/camofox_url ] || echo "::warning::Camofox not reachable - built-in tools fall back to visible Chrome"
+          # FALLBACK ONLY: launch a visible Chrome (with CDP) if and only if
+          # the Camofox server did NOT come up, so the built-in tools still
+          # have a browser to drive. Otherwise NO Chrome opens.
+          if [ ! -f /tmp/camofox_url ]; then
+            BROWSER_BIN=$(command -v google-chrome || command -v chromium-browser || command -v chromium || true)
+            if [ -n "$BROWSER_BIN" ]; then
+              mkdir -p "$HERMES_HOME/chrome-profile"
+              nohup "$BROWSER_BIN" --remote-debugging-port=9223 \
+                --user-data-dir="$HERMES_HOME/chrome-profile" \
+                --no-first-run --no-default-browser-check --disable-gpu \
+                --window-size=1600,900 about:blank > /tmp/chrome.log 2>&1 &
+              echo "Camofox down - started visible Chrome fallback (CDP 9223)"
+            else
+              echo "::warning::No Camofox and no Chrome found - built-in tools will be headless"
+            fi
+          else
+            echo "Camofox is the default browser - Chrome NOT started"
+          fi
 
           # ── LIVE DESKTOP VIEW: watch the agent work, from your browser ──
           # x11vnc mirrors display :99, noVNC serves a browser-based viewer on
@@ -1131,9 +1139,10 @@ jobs:
             ~/.hermes/work/ before doing anything else with it.
             Platform uploads land in a temporary cache that gets auto-deleted;
             the ~/.hermes/work/ copy is the only one that survives.
-          - VOICE IN, VOICE OUT: if the incoming Telegram or Slack message was
-            a VOICE / audio message, reply with VOICE too. Send your normal text
-            answer first, then speak it by running:
+          - ALWAYS VOICE-REPLY ON TELEGRAM & SLACK: for EVERY reply you send
+            over Telegram or Slack, send your normal text answer first and
+            then ALSO speak it - every single time, not only when the incoming
+            message was a voice note. Speak it by running:
               curl -s -X POST http://localhost:7777/voicereply \
                 -H "X-Token: $PANEL_TOKEN" -H 'Content-Type: application/json' \
                 -d '{"text":"<your reply text>","chat_id":"<telegram chat id>"}'
@@ -1141,9 +1150,25 @@ jobs:
             chat_id to use the default Telegram chat. Keep spoken replies short
             (2-4 sentences) and skip code blocks and URLs. The endpoint speaks
             with the Supertonic on-device model (Bangla automatically uses the
-            Edge Bangla voice).
-          - SENDING FILES TO THE BOSS (screenshots, video, any file): the
-            Jarvis HUD can now show files inline in the chat. Whenever the
+            Edge Bangla voice). This voice service runs locally on
+            127.0.0.1:7777; the old Jarvis web panel has been removed.
+          - TELEGRAM CALL (make the phone RING): for reminders, alarms,
+            urgent task results, or whenever the Boss asks to be CALLED, you
+            can place a real Telegram voice call that rings and speaks your
+            message out loud (free CallMeBot API):
+              curl -s -X POST http://localhost:7777/call \
+                -H "X-Token: $PANEL_TOKEN" -H 'Content-Type: application/json' \
+                -d '{"text":"<short message, max 256 chars>"}'
+            Rules: use it ONLY for urgent or explicitly requested alerts
+            (reminder due, task finished, task failed) - never for casual
+            chat; ALSO send the same info as a normal text message; keep the
+            call text under 256 characters, plain spoken words, no URLs or
+            code; Bangla text automatically uses the Bangla voice. If the
+            endpoint replies that CALLMEBOT_USER is not set, tell the Boss:
+            add repo secret CALLMEBOT_USER = your Telegram @username and send
+            /start to @CallMeBot_txtbot once to authorize calls.
+          - SENDING FILES TO THE BOSS (screenshots, video, any file): any
+            file you save is delivered inline into the Telegram/Slack chat. Whenever the
             user asks you for a screenshot, recording, report, export or ANY
             file, you MUST save it into the outbox folder:
               ~/.hermes/work/outputs/
@@ -1341,7 +1366,7 @@ jobs:
           echo "=================================================="
           echo "::notice title=🖥️ Hermes WebUI::$WEBUI_URL (password = PANEL_TOKEN secret)"
 
-      # ── 10b. Agent HUD — professional voice command deck (full agent brain) ──
+      # ── 10b. Voice reply service (Telegram / Slack TTS + file delivery) ──
       # Redesigned interface: professional dark HUD with a layered animated arc
       # reactor, smart end-of-speech detection (auto-sends when you stop
       # talking), barge-in interrupt (speak over the agent to cut it off),
@@ -1393,13 +1418,14 @@ jobs:
           echo "::notice title=Hermes Dashboard::$DASHBOARD_URL (user: boss / password = PANEL_TOKEN secret)"
         env:
           PANEL_TOKEN: ${{ secrets.PANEL_TOKEN }}
-      - name: Start Agent HUD interface
+      - name: Start voice reply service
         env:
           PANEL_TOKEN: ${{ secrets.PANEL_TOKEN }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          CALLMEBOT_USER: ${{ secrets.CALLMEBOT_USER }}
         run: |
           mkdir -p /tmp/jarvis
           cat > /tmp/jarvis/index.html <<'HUDHTML'
@@ -2519,6 +2545,7 @@ jobs:
           TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
           TG_CHAT = os.environ.get("TELEGRAM_USER_ID", "").strip()
           SLACK_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "").strip()
+          CMB_USER = os.environ.get("CALLMEBOT_USER", "").strip()
           app = Flask(__name__)
           app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024   # 200 MB uploads
           JOBS = {}
@@ -2860,6 +2887,38 @@ jobs:
                   return jsonify(error="no destination: pass chat_id or channel"), 400
               return jsonify(ok=True, engine=engine, sent=sent)
 
+          @app.route("/call", methods=["POST"])
+          def call_route():
+              """Make the Boss's Telegram actually RING and speak a message.
+              Free CallMeBot API (not the official Telegram API).
+              Body: {"text": "...", "lang": "optional voice", "user": "optional @username"}"""
+              if request.headers.get("X-Token", "") != TOKEN:
+                  return jsonify(error="bad token"), 401
+              d = request.get_json(silent=True) or {}
+              text = (d.get("text") or "").strip()[:256]
+              if not text:
+                  return jsonify(error="empty"), 400
+              who = (d.get("user") or CMB_USER).strip()
+              if not who:
+                  return jsonify(error="CALLMEBOT_USER secret not set - add your "
+                                       "Telegram @username as the CALLMEBOT_USER repo secret "
+                                       "and send /start to @CallMeBot_txtbot once"), 400
+              lang = (d.get("lang") or "").strip()
+              if not lang:
+                  # Bangla text -> Bangla standard voice, else English
+                  lang = "bn-IN-Standard-A" if any("\u0980" <= c <= "\u09ff" for c in text) else "en-GB-Standard-B"
+              try:
+                  r = rq.get("http://api.callmebot.com/start.php",
+                             params={"user": who, "text": text, "lang": lang,
+                                     "rpt": str(d.get("rpt") or 2),
+                                     "cc": (d.get("cc") or "missed")},
+                             timeout=45)
+                  ok = r.status_code == 200
+                  return jsonify(ok=ok, status=r.status_code,
+                                 detail=(r.text or "")[:300]), (200 if ok else 502)
+              except Exception as e:
+                  return jsonify(error="callmebot failed: %s" % e), 502
+
           @app.route("/file")
           def file_route():
               # <img>/<video> tags cannot send headers, so a query token is allowed here.
@@ -3002,7 +3061,7 @@ jobs:
               out["now"] = time.time()
               return jsonify(**out)
 
-          app.run(host="0.0.0.0", port=7777, threaded=True)
+          app.run(host="127.0.0.1", port=7777, threaded=True)
           PYJARVIS
           sudo apt-get install -y -q ffmpeg >/dev/null 2>&1 || true
           pip install -q flask requests edge-tts || true
@@ -3010,16 +3069,13 @@ jobs:
           pip install -q supertonic onnxruntime soundfile numpy > /tmp/supertonic_pip.log 2>&1 || echo '::warning::supertonic install failed - Edge TTS still works'
           nohup python3 /tmp/jarvis/app.py > /tmp/jarvis.log 2>&1 &
           sleep 2
-          curl -fs http://localhost:7777/ >/dev/null || { echo '::warning::Agent HUD failed to start'; cat /tmp/jarvis.log; }
-          nohup cloudflared tunnel --no-autoupdate --url http://localhost:7777 > /tmp/jarvis-tunnel.log 2>&1 &
-          JARVIS_URL=""
-          for i in $(seq 1 30); do
-            JARVIS_URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/jarvis-tunnel.log | head -n1 || true)
-            [ -n "$JARVIS_URL" ] && break
-            sleep 2
-          done
-          echo "JARVIS_URL=$JARVIS_URL" >> "$GITHUB_ENV"
-          echo "::notice title=🤖 Agent HUD::${JARVIS_URL:-tunnel failed}"
+          curl -fs http://127.0.0.1:7777/ >/dev/null 2>&1 || { echo '::warning::voice reply service failed to start'; cat /tmp/jarvis.log; }
+          echo "Voice reply service running locally on 127.0.0.1:7777 (powers Telegram/Slack voice + inline file delivery). Jarvis web panel removed - no public tunnel."
+          if [ -n "${CALLMEBOT_USER:-}" ]; then
+            echo "Telegram CALL alerts enabled via CallMeBot for $CALLMEBOT_USER"
+          else
+            echo "::notice::Telegram CALL alerts disabled - add repo secret CALLMEBOT_USER (your Telegram @username) and send /start to @CallMeBot_txtbot once to enable real ringing calls"
+          fi
 
 
 
@@ -3171,7 +3227,6 @@ jobs:
           TG_RESP=$(curl -s -X POST "${TG_API}/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_USER_ID}" \
             --data-urlencode text="🟢 Hermes Agent ONLINE (Telegram + Slack, NVIDIA/Mistral pool)
-          🤖 Agent HUD: ${JARVIS_URL:-not available} (token: your PANEL_TOKEN)
           🎛️ Model panel: ${PANEL_URL}
           🖥️ Hermes WebUI: ${WEBUI_URL:-not available}
           📊 Dashboard: ${DASHBOARD_URL:-not available} (user: boss)
@@ -3184,7 +3239,7 @@ jobs:
             *) echo "::warning::Telegram start notification FAILED - grab the links from the line below. Response: $(echo "$TG_RESP" | head -c 200)" ;;
           esac
           # belt-and-braces: links always land in this step log too
-          echo "LINKS: hud=${JARVIS_URL:-n/a} | model=${PANEL_URL:-n/a} | webui=${WEBUI_URL:-n/a} | dashboard=${DASHBOARD_URL:-n/a} | live=${LIVEVIEW_URL:-n/a}"
+          echo "LINKS: model=${PANEL_URL:-n/a} | webui=${WEBUI_URL:-n/a} | dashboard=${DASHBOARD_URL:-n/a} | live=${LIVEVIEW_URL:-n/a}"
 
       # ── 13. Run gateway with time budget + anti-stuck watchdog ──
       - name: Run Hermes gateway
