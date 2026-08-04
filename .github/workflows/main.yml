@@ -234,7 +234,7 @@ jobs:
         run: |
           # Shared virtual display :99 — the browser AND all the agent's GUI
           # work render here, so the LIVE VIEW (below) shows everything.
-          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb x11vnc novnc websockify fluxbox xterm pcmanfm mousepad
+          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb x11vnc novnc websockify fluxbox xterm pcmanfm mousepad xdotool wmctrl scrot imagemagick tesseract-ocr python3-tk
           Xvfb :99 -screen 0 1920x1080x24 > /tmp/xvfb99.log 2>&1 &
           sleep 2
           export DISPLAY=:99
@@ -275,13 +275,9 @@ jobs:
           chmod +x /tmp/status.sh
           xterm -geometry 130x20+30+30 -fg green -bg black -T "Hermes Agent — status" -e /tmp/status.sh &
 
-          # VISIBLE Chrome for the agent's built-in browser tools. Hermes'
-          # browser toolset speaks CDP, which only Chromium-family browsers
-          # support — Camoufox is Firefox-based (Juggler protocol), so the
-          # built-in tools can NOT drive it; without this they auto-launch an
-          # invisible headless browser. This Chrome runs HEADED on :99, so
-          # every built-in browser action shows up in the live view.
-          # Camoufox (port 9222) stays available for stealth scripting.
+          # VISIBLE Chrome on :99 - kept for the user's MANUAL tasks in the
+          # live view and as a CDP fallback for the built-in browser tools
+          # if the Camofox anti-detect server (below) fails to start.
           BROWSER_BIN=$(command -v google-chrome || command -v chromium-browser || command -v chromium || true)
           if [ -n "$BROWSER_BIN" ]; then
             mkdir -p "$HERMES_HOME/chrome-profile"
@@ -293,7 +289,7 @@ jobs:
           else
             echo "::warning::No Chromium-family browser found — built-in browser tools will be headless"
           fi
-          pip install -U "camoufox[geoip]" pyvirtualdisplay
+          pip install -U "camoufox[geoip]" pyvirtualdisplay pyautogui
           # fetch skips the ~200MB browser download when restored from cache
           python3 -m camoufox fetch
           mkdir -p "$HERMES_HOME/browser-profile"
@@ -315,6 +311,40 @@ jobs:
             sleep 3
           done
           cat /tmp/camoufox.log || true
+
+          # ── CAMOFOX SERVER: anti-detect backend for the BUILT-IN browser
+          # tools. Hermes routes ALL browser_* tools through it when
+          # CAMOFOX_URL is set: Camoufox = Firefox fork with C++-level
+          # fingerprint spoofing, so sites cannot detect/track agentic work
+          # (no CDP automation beacons like Chrome).
+          # HEADED + VISIBLE: camofox auto-runs NON-headless when a display
+          # exists, so with DISPLAY=:99 its window shows on the LIVE DESKTOP.
+          # Log into your accounts there over VNC - the agent works in that
+          # SAME browser and inherits your logged-in sessions.
+          # PERSISTENT LOGINS: cookies/localStorage saved to
+          # CAMOFOX_PROFILE_DIR under ~/.hermes/data so the backup loop
+          # carries your logins across runs.
+          # Fail-soft: without it, Configure falls back to visible Chrome.
+          git clone --depth 1 https://github.com/jo-inc/camofox-browser /tmp/camofox-browser 2>/dev/null || true
+          if [ -d /tmp/camofox-browser ]; then
+            mkdir -p "$HERMES_HOME/data/camofox-profiles"
+            ( cd /tmp/camofox-browser && timeout 600 npm install > /tmp/camofox-npm.log 2>&1 ) \
+              || echo "::warning::camofox-browser npm install failed - see /tmp/camofox-npm.log"
+            ( cd /tmp/camofox-browser && DISPLAY=:99 CAMOFOX_PORT=9377 \
+                CAMOFOX_BIND_HOST=127.0.0.1 \
+                CAMOFOX_PROFILE_DIR="$HERMES_HOME/data/camofox-profiles" \
+                nohup npm start > /tmp/camofox-srv.log 2>&1 & )
+            for i in $(seq 1 40); do
+              if curl -sf http://127.0.0.1:9377/health > /dev/null 2>&1 \
+                 || curl -sf http://127.0.0.1:9377/tabs > /dev/null 2>&1; then
+                echo "http://127.0.0.1:9377" > /tmp/camofox_url
+                echo "Camofox ready on :9377 - HEADED on :99 (log in via live desktop)"
+                break
+              fi
+              sleep 3
+            done
+          fi
+          [ -f /tmp/camofox_url ] || echo "::warning::Camofox not reachable - built-in tools fall back to visible Chrome"
 
           # ── LIVE DESKTOP VIEW: watch the agent work, from your browser ──
           # x11vnc mirrors display :99, noVNC serves a browser-based viewer on
@@ -1071,6 +1101,12 @@ jobs:
           CAMOUFOX_URL=ws://127.0.0.1:9222/hermes
           GROQ_API_KEY=${GROQ_API_KEY}
           EOF
+          # Hermes official Camofox mode - routes built-in browser_* tools
+          # through the anti-detect server (flag written in step 4 on success)
+          if [ -f /tmp/camofox_url ]; then
+            echo "CAMOFOX_URL=$(cat /tmp/camofox_url)" >> "$HERMES_HOME/.env"
+            echo "CAMOFOX_URL set - built-in browsing is anti-detect"
+          fi
 
       # ── 8. Standing instructions for the agent (auto save-to-file) ──
       - name: Write agent instructions
@@ -1126,12 +1162,79 @@ jobs:
             the user you cannot send files - save it to the outbox instead.
             Files are served only from ~/.hermes/work, ~/Desktop, ~/Pictures,
             ~/Videos, ~/Downloads and /tmp, so keep outputs in those places.
-          - BROWSER WORK MUST BE VISIBLE: the user watches this machine's
-            desktop live over VNC. Your built-in browser tools are already
-            wired to a visible Chrome. When you write your OWN browser
-            scripts (camoufox / playwright / selenium), ALWAYS pass
-            headless=False — NEVER headless=True or headless='virtual' — so
-            the window renders on the shared display the user is watching.
+          - BROWSER: your built-in browser_* tools run through Camofox - an
+            anti-detect Camoufox browser (Firefox with C++-level fingerprint
+            spoofing), so sites cannot detect or track your automation. It
+            runs HEADED on the shared display :99: the user SEES your
+            browsing live over VNC and can take the mouse to log into
+            accounts, solve captchas or step in - then you continue in that
+            SAME browser with their logged-in session. Logins persist in
+            ~/.hermes/data/camofox-profiles and survive across runs. If a
+            page needs the user's login or a captcha, ASK the user to do it
+            in the live desktop, wait for their confirmation, then continue.
+            When you write your OWN browser scripts, connect
+            playwright/camoufox to ws://127.0.0.1:9222/hermes or ALWAYS pass
+            headless=False - NEVER headless=True or headless='virtual' - so
+            windows show on the shared display. The visible Chrome
+            (CDP http://127.0.0.1:9223) is a last resort for CDP-only work;
+            assume sites can detect it.
+          - TYPING INTO WEB APPS (Facebook, Messenger, WhatsApp Web,
+            Instagram, X, Gmail, etc): NEVER inject text with CDP or
+            JavaScript (element.value=..., execCommand, innerHTML, synthetic
+            events). Rich chat boxes are React/contenteditable editors: the
+            injected text is NOT registered in the app's draft state, so the
+            send silently fails or sends empty. ALWAYS type like a human:
+            prefer your built-in browser tools (Camofox delivers REAL
+            keyboard/mouse events through Firefox's native input path), or
+            in your own scripts: page.click() the input first, then
+            page.keyboard.type(text, delay=80) - character-by-character -
+            then press Enter or click the app's real send button.
+          - VERIFY AFTER ACTING: after any send/submit/post, wait 2-3
+            seconds and CHECK the page - did the message appear in the chat
+            history? did the form advance? If not, retry ONCE with the
+            alternate submit path (Enter key vs send button). If it still
+            fails, take a screenshot, report exactly what you see, and ask
+            the user to step into the live desktop to unblock you. NEVER
+            claim success without seeing the result on the page, and NEVER
+            retry in a loop.
+          - ELEMENT MASTERY (work with ANY element on ANY website): be
+            methodical, not lucky.
+            1) SEE FIRST: take an accessibility/DOM snapshot (or a
+               screenshot) before acting. Target elements by their ROLE +
+               visible name / label / placeholder / aria-label - never by
+               guessed or brittle absolute coordinates.
+            2) WAIT FOR IT: modern sites (React/Vue/Angular) render late and
+               re-render. Wait until the element actually EXISTS, is VISIBLE
+               and STABLE before you act. Never act on the first paint.
+            3) CLEAR THE PATH: dismiss cookie banners, consent modals,
+               newsletter popups and overlays FIRST - they silently
+               intercept clicks. Then scroll the target into view.
+            4) GO DEEP: if the element is inside an IFRAME (checkouts,
+               captchas, embedded widgets) switch into that frame; if it is
+               in a SHADOW DOM, pierce the shadow root. Do not give up just
+               because a top-level query missed.
+            5) LADDER OF STRATEGIES: try role -> visible text -> label ->
+               placeholder -> aria-label -> nearby-label -> CSS/XPath. If
+               ALL selectors fail, FALL BACK TO VISION: screenshot, locate
+               the element visually, and click by its on-screen coordinates.
+            6) CONFIRM EACH STEP: after every click/type, check the page
+               actually changed (element appeared/disappeared, URL/route
+               moved) before the next step. Log what you did to the task
+               file so you can recover if interrupted.
+          - DESKTOP / PC CONTROL (drive ANY app in the live desktop, display
+            :99): you have real GUI-automation tools installed - xdotool
+            (mouse + keyboard), wmctrl (list/activate/move windows), scrot &
+            ImageMagick "import" (screenshots), tesseract-ocr (READ text off
+            the screen), and pyautogui (Python). ALWAYS export DISPLAY=:99.
+            Professional loop: SCREENSHOT -> locate the target (vision, or
+            tesseract OCR when you need exact on-screen text) -> ACT
+            (wmctrl -a "<window>" to focus, xdotool mousemove/click, xdotool
+            type --delay 80 "text", xdotool key ctrl+s / Return / Tab) ->
+            SCREENSHOT again to CONFIRM it worked. Prefer reliable keyboard
+            shortcuts over hunting through menus. Move deliberately (small
+            waits between actions) so the UI keeps up and the Boss can follow
+            on the live desktop. If you get stuck, screenshot, explain what
+            you see, and ask the Boss to step in via the live desktop.
 
           # Persona: JARVIS-style professional assistant
           - Your name is "Agent". Never call yourself JARVIS.
@@ -1178,9 +1281,15 @@ jobs:
           # more API retries — pool rotation sometimes needs several attempts
           hermes config set agent.api_max_retries 8
           hermes config set web.search_backend searxng
-          # point the built-in browser tools at the VISIBLE Chrome on :99
-          # (CDP port 9223, started in step 4) — live view shows every action
-          hermes config set browser.cdp_url "http://127.0.0.1:9223"
+          # Built-in browser tools: Camofox anti-detect mode when the server
+          # came up (CAMOFOX_URL in .env routes ALL browser_* tools through
+          # it). Otherwise fall back to the visible Chrome over CDP.
+          if [ -f /tmp/camofox_url ]; then
+            echo "Built-in browser tools: Camofox anti-detect (no CDP beacons)"
+          else
+            hermes config set browser.cdp_url "http://127.0.0.1:9223"
+            echo "Built-in browser tools: visible Chrome fallback (CDP :9223)"
+          fi
           # edge-tts CLI is needed by the tts toolset (free Microsoft voices)
           pip install -q edge-tts || true
           hermes config set tts.provider edge
@@ -3067,7 +3176,7 @@ jobs:
           🖥️ Hermes WebUI: ${WEBUI_URL:-not available}
           📊 Dashboard: ${DASHBOARD_URL:-not available} (user: boss)
           ⏱ Run length: ${RUN_HOURS_INPUT:-5.5} hours
-          🔭 Live desktop: ${LIVEVIEW_URL:-not available} (FULL control - pass: first 8 chars of PANEL_TOKEN)
+          🔭 Live desktop: ${LIVEVIEW_URL:-not available} (FULL control - pass: first 8 chars of PANEL_TOKEN - log into your accounts in the Camofox window, logins are saved)
           🔑 Password: your PANEL_TOKEN secret
           Use /model in Telegram or !model in Slack to switch models")
           case "$TG_RESP" in
