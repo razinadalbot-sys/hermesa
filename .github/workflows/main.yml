@@ -338,11 +338,40 @@ jobs:
               if curl -sf http://127.0.0.1:9377/health > /dev/null 2>&1 \
                  || curl -sf http://127.0.0.1:9377/tabs > /dev/null 2>&1; then
                 echo "http://127.0.0.1:9377" > /tmp/camofox_url
-                echo "Camofox ready on :9377 - browser visible on its OWN noVNC :6081 (window appears when a tab opens)"
+                echo "Camofox ready on :9377 - browser visible on its OWN noVNC :6081 (warm-started at boot)"
                 break
               fi
               sleep 3
             done
+          fi
+          # fix43: WARM START the browser engine NOW + keep it alive, so the
+          # noVNC view on :6081 is actually connectable from minute 1.
+          # The engine is lazy (starts on first use, dies ~5 min after last
+          # activity) and BROWSER_IDLE_TIMEOUT_MS is NOT in the server's
+          # forwarded env allowlist, so we cannot raise the idle timeout -
+          # instead we revive the engine whenever /vnc/status stops reporting
+          # running:true. Logins survive restarts via the persistent profile.
+          if [ -f /tmp/camofox_url ]; then
+            curl -s --max-time 30 -X POST http://127.0.0.1:9377/start \
+              -H 'Content-Type: application/json' -d '{}' \
+              > /tmp/camofox-warmstart.log 2>&1 || true
+            cat > /tmp/camofox-keepalive.sh <<'KAEOF'
+          #!/bin/bash
+          while true; do
+            sleep 45
+            st=$(curl -s --max-time 8 http://127.0.0.1:9377/vnc/status 2>/dev/null || true)
+            case "$st" in
+              *'"running":true'*) : ;;
+              *) curl -s --max-time 20 -X POST http://127.0.0.1:9377/start \
+                   -H 'Content-Type: application/json' -d '{}' \
+                   >> /tmp/camofox-keepalive.log 2>&1
+                 sleep 30 ;;
+            esac
+          done
+          KAEOF
+            chmod +x /tmp/camofox-keepalive.sh
+            nohup /tmp/camofox-keepalive.sh > /dev/null 2>&1 &
+            echo "Camofox warm start sent; keepalive loop running (revives engine after idle-out)"
           fi
           [ -f /tmp/camofox_url ] || echo "::warning::Camofox not reachable - built-in tools fall back to visible Chrome"
           # FALLBACK ONLY: launch a visible Chrome (with CDP) if and only if
@@ -1187,8 +1216,9 @@ jobs:
             spoofing), so sites cannot detect or track your automation. It
             renders on its OWN virtual display, NOT the main :99 desktop:
             the user watches and controls it via the dedicated "Camofox
-            browser" noVNC link from the start message. The window only
-            exists while a tab is open. The user can take the mouse there to
+            browser" noVNC link from the start message. A keepalive
+            restarts the engine if it idles out. The user can take the
+            mouse there to
             log into accounts, solve captchas or step in - then you continue
             in that SAME browser with their logged-in session. Logins persist
             in ~/.hermes/data/camofox-profiles and survive across runs. If a
@@ -3216,7 +3246,7 @@ jobs:
           📊 Dashboard: ${DASHBOARD_URL:-not available} (user: boss)
           ⏱ Run length: ${RUN_HOURS_INPUT:-5.5} hours
           🔭 Live desktop: ${LIVEVIEW_URL:-not available} (agent GUI + fallback Chrome - FULL control - pass: first 8 chars of PANEL_TOKEN)
-          🦊 Camofox browser: ${BROWSERVIEW_URL:-not available} (the agent's ACTUAL browser - log into your accounts HERE, logins are saved - window appears while a tab is open - same pass)
+          🦊 Camofox browser: ${BROWSERVIEW_URL:-not available} (the agent's ACTUAL browser - log into your accounts HERE, logins are saved - if it says Failed to connect wait ~1 min then click Connect - same pass)
           🔑 Password: your PANEL_TOKEN secret
           Use /model in Telegram or !model in Slack to switch models")
           case "$TG_RESP" in
