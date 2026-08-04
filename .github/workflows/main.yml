@@ -307,10 +307,17 @@ jobs:
           # CAMOFOX_URL is set: Camoufox = Firefox fork with C++-level
           # fingerprint spoofing, so sites cannot detect/track agentic work
           # (no CDP automation beacons like Chrome).
-          # HEADED + VISIBLE: camofox auto-runs NON-headless when a display
-          # exists, so with DISPLAY=:99 its window shows on the LIVE DESKTOP.
-          # Log into your accounts there over VNC - the agent works in that
-          # SAME browser and inherits your logged-in sessions.
+          # VISIBLE VIA ITS OWN VNC: the camofox server subprocess STRIPS
+          # DISPLAY (lib/config.js serverEnv), so the browser can never render
+          # on our :99 desktop - camoufox-js spawns its OWN private Xvfb.
+          # Official fix = bundled VNC plugin (ENABLE_VNC=1): it resizes that
+          # private Xvfb to 1920x1080, attaches x11vnc on :5901 and serves
+          # noVNC on :6081 (our own desktop owns :5900/:6080). Log into your
+          # accounts THERE - the agent works in that SAME browser and
+          # inherits your logged-in sessions.
+          # LAZY LAUNCH: the browser window only exists while a tab is open
+          # and shuts down after ~5 min idle (relaunches on next use), so an
+          # empty view does NOT mean it is broken.
           # PERSISTENT LOGINS: cookies/localStorage saved to
           # CAMOFOX_PROFILE_DIR under ~/.hermes/data so the backup loop
           # carries your logins across runs.
@@ -320,15 +327,18 @@ jobs:
             mkdir -p "$HERMES_HOME/data/camofox-profiles"
             ( cd /tmp/camofox-browser && timeout 600 npm install > /tmp/camofox-npm.log 2>&1 ) \
               || echo "::warning::camofox-browser npm install failed - see /tmp/camofox-npm.log"
-            ( cd /tmp/camofox-browser && DISPLAY=:99 CAMOFOX_PORT=9377 \
+            ( cd /tmp/camofox-browser && CAMOFOX_PORT=9377 \
                 CAMOFOX_BIND_HOST=127.0.0.1 \
                 CAMOFOX_PROFILE_DIR="$HERMES_HOME/data/camofox-profiles" \
+                ENABLE_VNC=1 VNC_RESOLUTION=1920x1080 \
+                VNC_PASSWORD="${PANEL_TOKEN:-hermes99}" \
+                VNC_PORT=5901 NOVNC_PORT=6081 \
                 nohup npm start > /tmp/camofox-srv.log 2>&1 & )
             for i in $(seq 1 40); do
               if curl -sf http://127.0.0.1:9377/health > /dev/null 2>&1 \
                  || curl -sf http://127.0.0.1:9377/tabs > /dev/null 2>&1; then
                 echo "http://127.0.0.1:9377" > /tmp/camofox_url
-                echo "Camofox ready on :9377 - HEADED on :99 (log in via live desktop)"
+                echo "Camofox ready on :9377 - browser visible on its OWN noVNC :6081 (window appears when a tab opens)"
                 break
               fi
               sleep 3
@@ -1175,17 +1185,22 @@ jobs:
           - BROWSER: your built-in browser_* tools run through Camofox - an
             anti-detect Camoufox browser (Firefox with C++-level fingerprint
             spoofing), so sites cannot detect or track your automation. It
-            runs HEADED on the shared display :99: the user SEES your
-            browsing live over VNC and can take the mouse to log into
-            accounts, solve captchas or step in - then you continue in that
-            SAME browser with their logged-in session. Logins persist in
-            ~/.hermes/data/camofox-profiles and survive across runs. If a
-            page needs the user's login or a captcha, ASK the user to do it
-            in the live desktop, wait for their confirmation, then continue.
+            renders on its OWN virtual display, NOT the main :99 desktop:
+            the user watches and controls it via the dedicated "Camofox
+            browser" noVNC link from the start message. The window only
+            exists while a tab is open. The user can take the mouse there to
+            log into accounts, solve captchas or step in - then you continue
+            in that SAME browser with their logged-in session. Logins persist
+            in ~/.hermes/data/camofox-profiles and survive across runs. If a
+            page needs the user's login or a captcha, OPEN a tab on that page
+            and KEEP it open (the window closes when no tabs are open), ASK
+            the user to log in via the Camofox browser link, wait for their
+            confirmation, then continue.
             When you write your OWN browser scripts, connect
             playwright/camoufox to ws://127.0.0.1:9222/hermes or ALWAYS pass
             headless=False - NEVER headless=True or headless='virtual' - so
-            windows show on the shared display. The visible Chrome
+            windows show on the shared display :99 (the main live desktop -
+            unlike the built-in Camofox tools). The visible Chrome
             (CDP http://127.0.0.1:9223) is a last resort for CDP-only work;
             assume sites can detect it.
           - TYPING INTO WEB APPS (Facebook, Messenger, WhatsApp Web,
@@ -1300,8 +1315,16 @@ jobs:
             hermes config set browser.cdp_url "http://127.0.0.1:9223"
             echo "Built-in browser tools: visible Chrome fallback (CDP :9223)"
           fi
-          # edge-tts CLI is needed by the tts toolset (free Microsoft voices)
-          pip install -q edge-tts || true
+          # edge-tts CLI is needed by the tts toolset (free Microsoft voices).
+          # ALWAYS upgrade to the latest release: Microsoft periodically breaks
+          # old edge-tts versions (auth/DRM token changes), which surfaces as
+          # "NoAudioReceived" from the built-in text_to_speech tool. The hermes
+          # venv is restored from CACHE with its own stale edge_tts copy that
+          # the built-in tool imports, so upgrade BOTH copies every run.
+          pip install -q -U edge-tts || true
+          "$HERMES_HOME/hermes-agent/venv/bin/pip" install -q -U edge-tts \
+            && echo "edge-tts upgraded inside hermes venv: $("$HERMES_HOME/hermes-agent/venv/bin/pip" show edge-tts 2>/dev/null | awk '/^Version/{print $2}')" \
+            || echo "::warning::could not upgrade edge-tts inside hermes venv - built-in TTS may fail with NoAudioReceived"
           hermes config set tts.provider edge
 
           hermes config set toolsets '["terminal","files","web","browser","code","vision","tts","memory","skills","delegation","cron"]'
@@ -3015,7 +3038,8 @@ jobs:
           app.run(host="127.0.0.1", port=7777, threaded=True)
           PYJARVIS
           sudo apt-get install -y -q ffmpeg >/dev/null 2>&1 || true
-          pip install -q flask requests edge-tts || true
+          pip install -q flask requests || true
+          pip install -q -U edge-tts || true
           # onnxruntime/soundfile are what Supertonic needs to run on CPU
           pip install -q supertonic onnxruntime soundfile numpy > /tmp/supertonic_pip.log 2>&1 || echo '::warning::supertonic install failed - Edge TTS still works'
           nohup python3 /tmp/jarvis/app.py > /tmp/jarvis.log 2>&1 &
@@ -3169,6 +3193,20 @@ jobs:
           done
           [ -n "$LIVEVIEW_URL" ] && LIVEVIEW_URL="${LIVEVIEW_URL}/vnc.html?autoconnect=1&resize=scale&reconnect=1"
           echo "::notice title=🔭 Live desktop view::${LIVEVIEW_URL:-tunnel failed}"
+          # fourth quick tunnel: CAMOFOX BROWSER VIEW. The browser renders on
+          # its OWN private Xvfb (never :99), exposed by the camofox VNC
+          # plugin as noVNC on :6081 - see the Start Camoufox step.
+          BROWSERVIEW_URL=""
+          if [ -f /tmp/camofox_url ]; then
+            nohup cloudflared tunnel --no-autoupdate --url http://localhost:6081 > /tmp/browserview-tunnel.log 2>&1 &
+            for i in $(seq 1 30); do
+              BROWSERVIEW_URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/browserview-tunnel.log | head -n1 || true)
+              [ -n "$BROWSERVIEW_URL" ] && break
+              sleep 2
+            done
+            [ -n "$BROWSERVIEW_URL" ] && BROWSERVIEW_URL="${BROWSERVIEW_URL}/vnc.html?autoconnect=1&resize=scale&reconnect=1"
+          fi
+          echo "::notice title=🦊 Camofox browser view::${BROWSERVIEW_URL:-not available}"
           TG_API="https://api.telegram.org"
           TG_RESP=$(curl -s -X POST "${TG_API}/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_USER_ID}" \
@@ -3177,7 +3215,8 @@ jobs:
           🖥️ Hermes WebUI: ${WEBUI_URL:-not available}
           📊 Dashboard: ${DASHBOARD_URL:-not available} (user: boss)
           ⏱ Run length: ${RUN_HOURS_INPUT:-5.5} hours
-          🔭 Live desktop: ${LIVEVIEW_URL:-not available} (FULL control - pass: first 8 chars of PANEL_TOKEN - log into your accounts in the Camofox window, logins are saved)
+          🔭 Live desktop: ${LIVEVIEW_URL:-not available} (agent GUI + fallback Chrome - FULL control - pass: first 8 chars of PANEL_TOKEN)
+          🦊 Camofox browser: ${BROWSERVIEW_URL:-not available} (the agent's ACTUAL browser - log into your accounts HERE, logins are saved - window appears while a tab is open - same pass)
           🔑 Password: your PANEL_TOKEN secret
           Use /model in Telegram or !model in Slack to switch models")
           case "$TG_RESP" in
@@ -3185,7 +3224,7 @@ jobs:
             *) echo "::warning::Telegram start notification FAILED - grab the links from the line below. Response: $(echo "$TG_RESP" | head -c 200)" ;;
           esac
           # belt-and-braces: links always land in this step log too
-          echo "LINKS: model=${PANEL_URL:-n/a} | webui=${WEBUI_URL:-n/a} | dashboard=${DASHBOARD_URL:-n/a} | live=${LIVEVIEW_URL:-n/a}"
+          echo "LINKS: model=${PANEL_URL:-n/a} | webui=${WEBUI_URL:-n/a} | dashboard=${DASHBOARD_URL:-n/a} | live=${LIVEVIEW_URL:-n/a} | browser=${BROWSERVIEW_URL:-n/a}"
 
       # ── 13. Run gateway with time budget + anti-stuck watchdog ──
       - name: Run Hermes gateway
