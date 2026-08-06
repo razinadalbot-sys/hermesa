@@ -333,19 +333,48 @@ jobs:
           if [ -d /tmp/camofox-browser ]; then
             mkdir -p "$HERMES_HOME/data/camofox-profiles"
             ( cd /tmp/camofox-browser && timeout 600 npm install > /tmp/camofox-npm.log 2>&1 ) \
-              || echo "::warning::camofox-browser npm install failed - see /tmp/camofox-npm.log"
-            ( cd /tmp/camofox-browser && CAMOFOX_PORT=9377 \
-                CAMOFOX_BIND_HOST=127.0.0.1 \
-                CAMOFOX_PROFILE_DIR="$HERMES_HOME/data/camofox-profiles" \
-                ENABLE_VNC=1 VNC_RESOLUTION=1920x1080 \
-                VNC_PASSWORD="${PANEL_TOKEN:-hermes99}" \
-                VNC_PORT=5901 NOVNC_PORT=6081 \
-                SESSION_TIMEOUT_MS=86400000 TAB_INACTIVITY_MS=86400000 \
-                BROWSER_IDLE_TIMEOUT_MS=86400000 \
-                NATIVE_MEM_RESTART_THRESHOLD_MB=2048 \
-                BROWSER_RSS_RESTART_THRESHOLD_MB=4096 \
-                nohup npm start > /tmp/camofox-srv.log 2>&1 & )
-            for i in $(seq 1 40); do
+              || { echo "npm install failed - retrying once"; \
+                   ( cd /tmp/camofox-browser && timeout 600 npm install >> /tmp/camofox-npm.log 2>&1 ) \
+                   || echo "::warning::camofox-browser npm install failed twice - see /tmp/camofox-npm.log"; }
+            # fix49: ONE canonical, idempotent launcher for the :9377 server.
+            # diagnostic: print the restart/idle knobs THIS clone actually
+            # reads, so a silent upstream rename shows up in the run log
+            grep -n "RESTART_THRESHOLD\|IDLE_TIMEOUT\|INACTIVITY" /tmp/camofox-browser/lib/config.js 2>/dev/null | head -20 || true
+            # Reused by this boot start, the mid-run recovery watchdog below
+            # and the agent itself (AGENTS.md tells it to run this script
+            # instead of claiming "camoufox is not running").
+            cat > /tmp/camofox-restart.sh <<EOSTART
+          #!/bin/bash
+          if curl -sf http://127.0.0.1:9377/health >/dev/null 2>&1 \\
+             || curl -sf http://127.0.0.1:9377/tabs >/dev/null 2>&1; then
+            echo "camofox already up on :9377"; exit 0
+          fi
+          pkill -f "node.*camofox-browser" 2>/dev/null; sleep 2
+          cd /tmp/camofox-browser || exit 1
+          # fix50: NEVER stop/restart the browser mid-run:
+          #  - BROWSER_IDLE_TIMEOUT_MS=0 -> idle kill fully OFF (0 = never, per docs)
+          #  - session/tab inactivity raised to 7 days (longer than any run)
+          #  - memory-pressure restart thresholds set unreachably high
+          #  - MAX_OLD_SPACE_SIZE=2048 -> Node heap cannot OOM while VNC streams
+          CAMOFOX_PORT=9377 \\
+            CAMOFOX_BIND_HOST=127.0.0.1 \\
+            CAMOFOX_PROFILE_DIR="$HERMES_HOME/data/camofox-profiles" \\
+            ENABLE_VNC=1 VNC_RESOLUTION=1920x1080 \\
+            VNC_PASSWORD="${PANEL_TOKEN:-hermes99}" \\
+            VNC_PORT=5901 NOVNC_PORT=6081 \\
+            SESSION_TIMEOUT_MS=604800000 TAB_INACTIVITY_MS=604800000 \\
+            BROWSER_IDLE_TIMEOUT_MS=0 \\
+            NATIVE_MEM_RESTART_THRESHOLD_MB=999999 \\
+            BROWSER_RSS_RESTART_THRESHOLD_MB=999999 \\
+            MAX_OLD_SPACE_SIZE=2048 \\
+            nohup npm start >> /tmp/camofox-srv.log 2>&1 &
+          echo "camofox (re)start issued on :9377"
+          EOSTART
+            chmod +x /tmp/camofox-restart.sh
+            bash /tmp/camofox-restart.sh
+            # first boot can be slow (big npm tree + engine warm-up):
+            # wait up to 4 minutes, not 2, before declaring it down.
+            for i in $(seq 1 80); do
               if curl -sf http://127.0.0.1:9377/health > /dev/null 2>&1 \
                  || curl -sf http://127.0.0.1:9377/tabs > /dev/null 2>&1; then
                 echo "http://127.0.0.1:9377" > /tmp/camofox_url
@@ -354,6 +383,11 @@ jobs:
               fi
               sleep 3
             done
+            if [ ! -f /tmp/camofox_url ]; then
+              echo "── Camofox did NOT come up - dumping logs for debugging ──"
+              tail -n 40 /tmp/camofox-npm.log 2>/dev/null || true
+              tail -n 60 /tmp/camofox-srv.log 2>/dev/null || true
+            fi
           fi
           # fix43: WARM START the browser engine NOW + keep it alive, so the
           # noVNC view on :6081 is actually connectable from minute 1.
@@ -363,25 +397,21 @@ jobs:
           # session/tab/idle timeouts to 24h and the auto-restart
           # thresholds (native-mem 300MB -> 2GB, browser RSS 1.5GB -> 4GB)
           # that were closing ALL windows mid-login (the Facebook vanish).
-          # The keepalive (python) still revives the engine if down AND
-          # keeps ONE placeholder tab (userId boss-view) refreshed every 2
-          # min, so the tab-inactivity (5 min) and engine-idle (5 min)
-          # timers never fire: a window is ALWAYS rendered (no black screen,
-          # the display has no window manager so no-window = black) and the
-          # engine never dies (no VNC disconnect cycle).
+          # The keepalive (python) ONLY revives the engine if it is truly
+          # down, and opens ONE placeholder tab (userId boss-view) a single
+          # time so a window is ALWAYS rendered (no black screen - the
+          # display has no window manager so no-window = black). It NEVER
+          # refreshes or reloads anything (fix51): timers are fully off, so
+          # the browser stays exactly as it was left.
           # fix47: it also exports boss-view cookies to the data-repo dir
           # every cycle and re-imports them into fresh sessions, so logins
           # survive engine restarts AND whole machine runs.
-          if [ -f /tmp/camofox_url ]; then
-            curl -s --max-time 30 -X POST http://127.0.0.1:9377/start \
-              -H 'Content-Type: application/json' -d '{}' \
-              > /tmp/camofox-warmstart.log 2>&1 || true
-            cat > /tmp/camofox-keepalive.py <<'PYKA'
+          cat > /tmp/camofox-keepalive.py <<'PYKA'
           #!/usr/bin/env python3
           # Keep the Camofox engine AND one placeholder tab alive so the
           # noVNC view always shows a browser window (no black screen) and
           # x11vnc never dies from the 5-min idle shutdown (no disconnects).
-          import json, os, time, urllib.request
+          import json, os, subprocess, time, urllib.request
 
           BASE = "http://127.0.0.1:9377"
           STATE = (os.environ.get("CAMOFOX_STATE_FILE") or
@@ -439,21 +469,41 @@ jobs:
               except Exception:
                   pass
 
+          def engine_up():
+              # Trust the same /tabs health check the restart script uses.
+              # A mis-shaped /vnc/status reply must NEVER trigger /start
+              # spam (that showed up as "the browser restarts every minute").
+              try:
+                  req("GET", "/tabs", timeout=8)
+                  return True
+              except Exception:
+                  pass
+              try:
+                  st = req("GET", "/vnc/status", timeout=8)
+                  return bool(st.get("running") or st.get("active") or st.get("up"))
+              except Exception:
+                  return False
+
           tab = None
           while True:
               try:
-                  st = req("GET", "/vnc/status", timeout=8)
-                  if not st.get("running"):
+                  if not engine_up():
+                      # engine (or whole server) truly down -> revive it,
+                      # then warm-start the browser. NEVER restart when up.
+                      try:
+                          subprocess.call(["bash", "/tmp/camofox-restart.sh"], timeout=180)
+                      except Exception:
+                          pass
                       try:
                           req("POST", "/start", {}, timeout=40)
                       except Exception:
                           pass
                       time.sleep(15)
-                  if tab:
-                      try:
-                          req("POST", "/tabs/" + str(tab) + "/refresh", {}, timeout=30)
-                      except Exception:
-                          tab = None
+                      tab = None
+                  # fix51: NO auto tab refresh - EVER. Idle/inactivity timers
+                  # are fully off, so nothing needs "keeping alive". The
+                  # placeholder tab is created ONCE (below) and never touched
+                  # again; every page stays EXACTLY as you or the agent left it.
                   if not tab:
                       for target in (IDLE_PAGE, "about:blank"):
                           try:
@@ -470,8 +520,12 @@ jobs:
                   save_cookies()
               except Exception:
                   pass
-              time.sleep(120)
+              time.sleep(60)
           PYKA
+          if [ -f /tmp/camofox_url ]; then
+            curl -s --max-time 30 -X POST http://127.0.0.1:9377/start \
+              -H 'Content-Type: application/json' -d '{}' \
+              > /tmp/camofox-warmstart.log 2>&1 || true
             CAMOFOX_STATE_FILE="$HERMES_HOME/data/camofox-profiles/boss-view-storage.json" nohup python3 /tmp/camofox-keepalive.py > /tmp/camofox-keepalive.log 2>&1 &
             echo "Camofox warm start sent; keepalive keeps engine + placeholder tab alive (no more idle shutdown)"
           fi
@@ -493,6 +547,43 @@ jobs:
             fi
           else
             echo "Camofox is the default browser - Chrome NOT started"
+          fi
+
+          # ── fix49 MID-RUN RECOVERY: if Camofox did NOT come up at boot,
+          # keep retrying in the background instead of dooming the whole
+          # 5.5h run to the Chrome fallback. On success it re-points .env +
+          # hermes config at Camofox, kills the fallback Chrome and starts
+          # the keepalive - the agent returns to anti-detect browsing
+          # without a restart.
+          if [ ! -f /tmp/camofox_url ] && [ -d /tmp/camofox-browser ]; then
+            cat > /tmp/camofox-recover.sh <<'EORECOV'
+          #!/bin/bash
+          for i in $(seq 1 30); do
+            sleep 120
+            [ -f /tmp/camofox_url ] && exit 0
+            bash /tmp/camofox-restart.sh >/dev/null 2>&1
+            sleep 40
+            if curl -sf http://127.0.0.1:9377/health >/dev/null 2>&1 \
+               || curl -sf http://127.0.0.1:9377/tabs >/dev/null 2>&1; then
+              echo "http://127.0.0.1:9377" > /tmp/camofox_url
+              if [ -f "$HERMES_HOME/.env" ] && ! grep -q '^CAMOFOX_URL=' "$HERMES_HOME/.env"; then
+                echo "CAMOFOX_URL=http://127.0.0.1:9377" >> "$HERMES_HOME/.env"
+                echo "CAMOFOX_USER_ID=boss-view" >> "$HERMES_HOME/.env"
+              fi
+              hermes config unset browser.cdp_url >/dev/null 2>&1 || true
+              hermes config set browser.camofox.user_id boss-view >/dev/null 2>&1 || true
+              pkill -f 'remote-debugging-port=9223' 2>/dev/null || true
+              curl -s --max-time 30 -X POST http://127.0.0.1:9377/start -H 'Content-Type: application/json' -d '{}' >/dev/null 2>&1 || true
+              CAMOFOX_STATE_FILE="$HERMES_HOME/data/camofox-profiles/boss-view-storage.json" nohup python3 /tmp/camofox-keepalive.py > /tmp/camofox-keepalive.log 2>&1 &
+              echo "$(date) camofox recovered - switched agent back from Chrome fallback"
+              exit 0
+            fi
+          done
+          echo "$(date) camofox never came up - staying on Chrome fallback"
+          EORECOV
+            chmod +x /tmp/camofox-recover.sh
+            nohup bash /tmp/camofox-recover.sh > /tmp/camofox-recover.log 2>&1 &
+            echo "camofox recovery watchdog started (retries every ~2.5 min)"
           fi
 
           # ── LIVE DESKTOP VIEW: watch the agent work, from your browser ──
@@ -1263,8 +1354,8 @@ jobs:
             # ephemeral userId per task = fresh logged-out WINDOW each time
             # (the "multiple windows" + "ignores my logins" complaints).
             # session_key stays UNSET on purpose: Hermes opens its OWN tab
-            # per task instead of adopting the placeholder tab, so the
-            # keepalive's 2-min refresh never reloads the agent's page.
+            # per task instead of adopting the placeholder tab. (Keepalive
+            # auto-refresh is REMOVED - fix51 - no tab is ever reloaded.)
             echo "CAMOFOX_USER_ID=boss-view" >> "$HERMES_HOME/.env"
             echo "CAMOFOX_URL set - built-in browsing is anti-detect (shared boss-view session)"
           fi
@@ -1360,6 +1451,25 @@ jobs:
             unlike the built-in Camofox tools). The visible Chrome
             (CDP http://127.0.0.1:9223) is a last resort for CDP-only work;
             assume sites can detect it.
+          - CAMOFOX "NOT RUNNING"? CHECK, NEVER GUESS: your built-in browser
+            tools' Camofox window lives on its OWN private display (the
+            "Camofox browser" noVNC :6081 link) - it is NEVER visible on the
+            main :99 desktop. A Camoufox window that IS visible on the live
+            desktop is the SEPARATE script browser (ws://127.0.0.1:9222) - a
+            different process, so it proves NOTHING about the built-in
+            backend. Never conclude "camoufox is not running" from a failed
+            tool call or from looking at any desktop. Check the real backend:
+              curl -s http://127.0.0.1:9377/health   (or /tabs)
+            If it answers: Camofox IS running - retry your built-in
+            browser_* tool (e.g. open https://gmail.com with it directly).
+            If it does NOT answer: restart it yourself, then retry:
+              bash /tmp/camofox-restart.sh   (wait ~30s, re-check /health)
+            Only if the restart + health check BOTH still fail, tell the
+            user Camofox is down and fall back to a playwright/camoufox
+            script on ws://127.0.0.1:9222/hermes (headless=False) or, as a
+            LAST resort, Chrome CDP :9223. NEVER launch your own new
+            Chrome/Chromium/browser-use instance for a task the built-in
+            browser tools can do.
           - TYPING INTO WEB APPS (Facebook, Messenger, WhatsApp Web,
             Instagram, X, Gmail, etc): NEVER inject text with CDP or
             JavaScript (element.value=..., execCommand, innerHTML, synthetic
@@ -1467,11 +1577,21 @@ jobs:
           # came up (CAMOFOX_URL in .env routes ALL browser_* tools through
           # it). Otherwise fall back to the visible Chrome over CDP.
           if [ -f /tmp/camofox_url ]; then
+            # fix49: UNSET the Chrome CDP pin FIRST. hermes config persists
+            # in the data repo across runs, so ONE bad run that fell back to
+            # Chrome left browser.cdp_url set FOREVER: every later run then
+            # drove Chrome (or errored on the dead :9223 port - "browser is
+            # not running / unable to start") even while Camofox was up and
+            # visible. Same stale-config trap as the providers.* unsets above.
+            hermes config unset browser.cdp_url || true
             # fix48: same shared identity in config.yaml too (the .env var
             # takes precedence; this covers direct hermes runs/doctor)
             hermes config set browser.camofox.user_id boss-view
             echo "Built-in browser tools: Camofox anti-detect (no CDP beacons) - shared boss-view session"
           else
+            # mirror-image cleanup: drop the camofox identity so built-in
+            # tools never sit waiting on a dead :9377 server in fallback mode
+            hermes config unset browser.camofox.user_id || true
             hermes config set browser.cdp_url "http://127.0.0.1:9223"
             echo "Built-in browser tools: visible Chrome fallback (CDP :9223)"
           fi
