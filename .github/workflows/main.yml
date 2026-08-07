@@ -3327,6 +3327,2028 @@ jobs:
           curl -fs http://127.0.0.1:7777/ >/dev/null 2>&1 || { echo '::warning::voice reply service failed to start'; cat /tmp/jarvis.log; }
           echo "Voice reply service running locally on 127.0.0.1:7777 (powers Telegram/Slack voice + inline file delivery). Jarvis web panel removed - no public tunnel."
 
+      # ------------------------------------------------------------------
+      # Live voice calls between the Agent Ai app user and Hermes itself.
+      # The app publishes an invite at hermesCalls/{botId}; this bridge joins
+      # the same WebRTC room, listens (Groq Whisper), asks Hermes, and speaks
+      # the answer back with edge-tts. Real two-way conversation, no fees.
+      # ------------------------------------------------------------------
+      - name: Start Hermes live voice call bridge
+        continue-on-error: true
+        env:
+          HERMES_DB_URL: ${{ secrets.AGENT_AI_DB_URL || 'https://shawall-default-rtdb.firebaseio.com' }}
+          HERMES_DB_TOKEN: ${{ secrets.AGENT_AI_DB_TOKEN }}
+          HERMES_USER_ID: ${{ secrets.HERMES_USER_ID }}
+          # Optional. Leave unset and the bridge reads the owner's bots
+          # from bots/{HERMES_USER_ID} and answers for those.
+          HERMES_BOT_ID: ${{ secrets.HERMES_BOT_ID }}
+          # Optional: comma separated user ids allowed to call it.
+          HERMES_OWNER_IDS: ${{ secrets.HERMES_OWNER_IDS }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          HERMES_AGENT_NAME: Hermes
+          HERMES_TTS_VOICE: en-US-AriaNeural
+          HERMES_TTS_VOICE_EN: en-US-AriaNeural
+          HERMES_TTS_VOICE_BN: bn-BD-NabanitaNeural
+          HERMES_CHAT_CMD: hermes chat -q
+          HERMES_POOL_URL: http://localhost:4000/v1
+          HERMES_POOL_MODEL: pool-auto
+        run: |
+          set +e
+          echo "Installing WebRTC bridge dependencies..."
+          python3 -m pip install --quiet --upgrade aiortc av requests >/tmp/aiortc-install.log 2>&1 || \
+            echo "::warning::aiortc install failed - live voice calls disabled"
+          command -v ffmpeg >/dev/null 2>&1 || sudo apt-get install -y -qq ffmpeg >/dev/null 2>&1
+
+          # Local neural voice for English. Piper runs on the CPU with no
+          # network round trip, so replies start speaking almost instantly
+          # instead of waiting on a cloud TTS request. Bangla still uses
+          # edge-tts because there is no comparable local Bangla voice.
+          python3 -m pip install --quiet --upgrade piper-tts >>/tmp/aiortc-install.log 2>&1 || \
+            echo "::warning::piper-tts unavailable - English will use edge-tts"
+          PIPER_DIR="$HERMES_HOME/piper-voices"
+          mkdir -p "$PIPER_DIR"
+          if [ ! -s "$PIPER_DIR/en_US-amy-medium.onnx" ]; then
+            PV="https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium"
+            curl -fsSL "$PV/en_US-amy-medium.onnx" \
+              -o "$PIPER_DIR/en_US-amy-medium.onnx" 2>/dev/null || true
+            curl -fsSL "$PV/en_US-amy-medium.onnx.json" \
+              -o "$PIPER_DIR/en_US-amy-medium.onnx.json" 2>/dev/null || true
+          fi
+          if [ -s "$PIPER_DIR/en_US-amy-medium.onnx" ]; then
+            echo "local English voice ready: piper amy (female)"
+          else
+            echo "::warning::piper voice model missing - English will use edge-tts"
+          fi
+
+          cat > "$HERMES_HOME/hermes_live_call.py" <<'HERMESCALLEOF'
+          #!/usr/bin/env python3
+          """
+          Hermes live voice call bridge
+          =============================
+
+          Makes the Hermes agent joinable as a real participant in an Agent Ai voice
+          call, so the user can *talk* to Hermes and hear it answer, live.
+
+          How it fits together
+          --------------------
+          1. In the app the user opens a bot chat and taps the call button. The app
+             creates a WebRTC room and publishes an invite:
+
+                 hermesCalls/{botId} = {roomId, botId, userId, userName, status, createdAt}
+
+          2. This bridge polls that node. When an invite appears it joins the very same
+             room using the app's existing Firebase signalling layout:
+
+                 rtc/{roomId}/participants/{id}          {id, name, avatar, joinedAt}
+                 rtc/{roomId}/links/{a}__{b}/offer       written by the lower id
+                 rtc/{roomId}/links/{a}__{b}/answer      written by the higher id
+                 rtc/{roomId}/links/{a}__{b}/cand_{id}/  trickle ICE candidates
+                 rtc/{roomId}/state                      accepted | declined | ended
+
+          3. Inbound Opus audio -> 16 kHz PCM -> Groq Whisper (speech to text).
+          4. The transcript goes to Hermes (`hermes chat -q`, or the local model pool).
+          5. The answer goes through edge-tts -> 48 kHz PCM -> back into the call.
+
+          Requirements
+          ------------
+              pip install aiortc av requests
+              ffmpeg and edge-tts on PATH (both already present in the Hermes workflow)
+
+          Environment
+          -----------
+              HERMES_DB_URL     Firebase Realtime Database URL (same one the app uses)
+              HERMES_DB_TOKEN   optional ?auth= token when your rules require it
+              HERMES_AGENT_NAME display name shown in the call        (default "Hermes")
+              GROQ_API_KEY      speech to text
+              HERMES_STT_MODEL  default whisper-large-v3-turbo
+              HERMES_TTS_VOICE_EN  English voice   (default en-US-AriaNeural)
+              HERMES_TTS_VOICE_BN  Bangla voice    (default bn-BD-NabanitaNeural)
+              HERMES_PIPER_MODEL   local Piper .onnx used for English when present
+              HERMES_CHAT_CMD   default "hermes chat -q"
+              HERMES_POOL_URL   fallback chat endpoint (default http://localhost:4000/v1)
+              HERMES_POOL_MODEL default pool-auto
+          """
+
+          import argparse
+          import asyncio
+          import audioop
+          import collections
+          import fractions
+          import io
+          import json
+          import threading
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          import os
+          import shlex
+          import shutil
+          import subprocess
+          import sys
+          import time
+          import uuid
+          import re
+          import wave
+          from datetime import datetime, timedelta
+          try:
+              from zoneinfo import ZoneInfo
+          except Exception:  # pragma: no cover - very old python
+              ZoneInfo = None
+
+          import av
+          import requests
+          from aiortc import (
+              RTCConfiguration,
+              RTCIceServer,
+              RTCPeerConnection,
+              RTCSessionDescription,
+              MediaStreamTrack,
+          )
+          from aiortc.sdp import candidate_from_sdp
+
+          # --------------------------------------------------------------------------
+          # configuration
+          # --------------------------------------------------------------------------
+
+          DB_URL = os.environ.get("HERMES_DB_URL", "https://shawall-default-rtdb.firebaseio.com").rstrip("/")
+          # Who Hermes rings when no user id is supplied. Set HERMES_USER_ID to pin
+          # it; otherwise the bridge finds the account by itself the first time.
+          DEFAULT_USER_ID = (os.environ.get("HERMES_USER_ID", "").strip()
+                             or os.environ.get("AGENT_AI_USER", "").strip())
+          DB_TOKEN = os.environ.get("HERMES_DB_TOKEN", "").strip()
+          AGENT_NAME = os.environ.get("HERMES_AGENT_NAME", "Hermes")
+          # Which bot this bridge is. Several people share the app, and each of
+          # them runs their own Hermes, so a bridge must answer only the invites
+          # addressed to its own bot and ignore everybody else's.
+          BOT_ID = os.environ.get("HERMES_BOT_ID", "hermes").strip()
+          # True when the bot id was pinned by hand. Otherwise the bridge reads
+          # the owner's bots out of the database and answers for those.
+          BOT_ID_PINNED = bool(os.environ.get("HERMES_BOT_ID", "").strip())
+          # Set to 1 only for a shared Hermes that should answer any bot id.
+          ACCEPT_ANY_BOT = os.environ.get("HERMES_ACCEPT_ANY_BOT", "") == "1"
+          # Optional extra lock: a comma separated list of user ids allowed to
+          # call this bridge. Empty means the bot id check is the only gate.
+          OWNER_IDS = set(
+              part.strip()
+              for part in os.environ.get("HERMES_OWNER_IDS", "").split(",")
+              if part.strip()
+          )
+          GROQ_KEY = os.environ.get("GROQ_API_KEY", "").strip()
+          STT_MODEL = os.environ.get("HERMES_STT_MODEL", "whisper-large-v3-turbo")
+          TTS_VOICE = os.environ.get("HERMES_TTS_VOICE", "en-US-AriaNeural")
+
+          # ---- language aware voices ----------------------------------------------
+          # English is spoken by a local Piper neural voice. It runs on the CPU with
+          # no network round trip, so the first syllable lands in a fraction of the
+          # time a cloud voice needs - that is what keeps the call feeling live.
+          # Bangla has no good local voice, so it uses the Microsoft Bangla female
+          # voice through edge-tts. Switching happens per sentence, so a mixed
+          # Banglish reply is spoken correctly on both sides.
+          TTS_VOICE_EN = os.environ.get("HERMES_TTS_VOICE_EN", TTS_VOICE)
+          TTS_VOICE_BN = os.environ.get("HERMES_TTS_VOICE_BN", "bn-BD-NabanitaNeural")
+          PIPER_BIN = os.environ.get("HERMES_PIPER_BIN", "piper")
+          PIPER_MODEL = os.environ.get(
+              "HERMES_PIPER_MODEL",
+              os.path.join(
+                  os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")),
+                  "piper-voices", "en_US-amy-medium.onnx",
+              ),
+          )
+          # Bengali occupies this Unicode block; one character is enough to switch.
+          BENGALI_RE = re.compile("[\u0980-\u09ff]")
+          CHAT_CMD = os.environ.get("HERMES_CHAT_CMD", "hermes chat -q")
+          POOL_URL = os.environ.get("HERMES_POOL_URL", "http://localhost:4000/v1").rstrip("/")
+          POOL_MODEL = os.environ.get("HERMES_POOL_MODEL", "pool-auto")
+
+          GREETING = os.environ.get(
+              "HERMES_GREETING",
+              "Hermes here. I am listening, go ahead.",
+          )
+
+          SAMPLE_RATE = 48000          # what WebRTC carries
+          STT_RATE = 16000             # what Whisper wants
+          FRAME_SAMPLES = 960          # 20 ms at 48 kHz
+          SILENCE_RMS = 500            # below this counts as silence
+          MIN_SPEECH_MS = 400          # ignore coughs and clicks
+          END_SILENCE_MS = 900         # this much silence ends an utterance
+          MAX_UTTERANCE_MS = 25000     # hard stop so we always answer something
+
+          # ---- voice activity detection -------------------------------------------
+          # Speech is modulated and sits in a middle zero-crossing band. Wind, fans,
+          # traffic and room tone are steady and land either well below that band
+          # (rumble) or well above it (hiss). We track the room noise floor live and
+          # judge every 20 ms frame against it instead of against a fixed number.
+          SPEECH_RMS_FACTOR = 1.9      # normal listening: how far above the floor
+          BARGE_RMS_FACTOR = 3.4       # cutting Hermes off needs much more certainty
+          BARGE_MIN_RMS = 850          # absolute floor for an interruption
+          BARGE_MIN_MS = 320           # speech must hold this long to interrupt
+          ZCR_MIN = 0.020              # below this it is rumble or wind, not a voice
+          ZCR_MAX = 0.320              # above this it is hiss, clicks or static
+          NOISE_ADAPT = 0.02           # how fast the noise floor follows the room
+          MODULATION_MIN = 1.6         # speech swings in level; a fan does not
+          PREROLL_MS = 420             # audio kept so the first word is never lost
+          BARGE_IN = os.environ.get("HERMES_BARGE_IN", "1").lower() not in (
+              "0", "false", "no", "off")
+
+          # ---- reply shaping -------------------------------------------------------
+          HISTORY_TURNS = 6            # how much of the call the model gets to see
+          MAX_SENTENCES = 3            # a phone answer, not an essay
+          MAX_REPLY_CHARS = 420
+          # "pool" is stateless, so the reply can never drag in an unrelated chat
+          # history. Set HERMES_CALL_BACKEND=cli to route calls through the Hermes
+          # CLI instead, or =auto to try the pool first and fall back to the CLI.
+          CALL_BACKEND = os.environ.get("HERMES_CALL_BACKEND", "auto").strip().lower()
+          # Browser work, shell commands and file jobs go through the Hermes CLI,
+          # because that is the only path with the tools attached. Those runs are far
+          # slower than a chat reply, so they get their own timeout.
+          AGENT_TIMEOUT = int(os.environ.get("HERMES_AGENT_TIMEOUT", "300"))
+          CHAT_TIMEOUT = int(os.environ.get("HERMES_CHAT_TIMEOUT", "90"))
+
+          # ---- echo control --------------------------------------------------------
+          # The caller's microphone also picks up Hermes leaking out of their own
+          # speaker. That echo is loud, modulated and lands in the speech band, so
+          # without these guards it looks exactly like an interruption and chops the
+          # sentence in half - which is what "cutting off" actually was.
+          ECHO_GUARD_FACTOR = 1.5      # extra strictness while Hermes is talking
+          ECHO_MARGIN = 1.45           # caller must beat our own output level by this
+          BARGE_GRACE_MS = 650         # let the phone echo canceller settle first
+          DRIFT_RESYNC_S = 0.35        # re-anchor the audio clock past this much lag
+          SEGMENT_GAP_MS = 45          # breathing room between two voice segments
+          FADE_MS = 6                  # fade edges so joins never click
+          TAIL_PAD_MS = 140            # keeps the last word from being clipped
+          RING_TIMEOUT_S = 45          # how long we let the phone ring
+          CONTROL_PORT = int(os.environ.get("HERMES_CALL_PORT", "7788"))
+          LOCAL_TZ = os.environ.get("HERMES_TZ", "Asia/Dhaka")
+          # If the runner was asleep when a call was due, still make it this many
+          # minutes late rather than silently dropping it.
+          LATE_GRACE_MIN = int(os.environ.get("HERMES_LATE_GRACE_MIN", "180"))
+
+          # Outgoing call requests picked up from the control port or the database.
+          PENDING = []
+          PENDING_LOCK = threading.Lock()
+
+          ICE = RTCConfiguration([
+              RTCIceServer(urls=["stun:stun.l.google.com:19302"]),
+              RTCIceServer(urls=["stun:stun1.l.google.com:19302"]),
+              RTCIceServer(urls=["stun:stun2.l.google.com:19302"]),
+          ])
+
+
+          def log(*parts):
+              print("[hermes-call]", *parts, flush=True)
+
+
+          # --------------------------------------------------------------------------
+          # Firebase Realtime Database REST helpers (same transport the app uses)
+          # --------------------------------------------------------------------------
+
+
+          def _url(path):
+              url = "%s/%s.json" % (DB_URL, path.strip("/"))
+              if DB_TOKEN:
+                  url += "?auth=%s" % DB_TOKEN
+              return url
+
+
+          def db_get(path):
+              try:
+                  r = requests.get(_url(path), timeout=15)
+                  if r.status_code != 200:
+                      return None
+                  body = r.text.strip()
+                  if not body or body == "null":
+                      return None
+                  return json.loads(body)
+              except Exception as exc:
+                  log("db_get failed", path, exc)
+                  return None
+
+
+          def db_put(path, value):
+              try:
+                  requests.put(_url(path), data=json.dumps(value), timeout=15)
+                  return True
+              except Exception as exc:
+                  log("db_put failed", path, exc)
+                  return False
+
+
+          def db_delete(path):
+              try:
+                  requests.delete(_url(path), timeout=15)
+                  return True
+              except Exception:
+                  return False
+
+
+          # --------------------------------------------------------------------------
+          # placing a call *to* the user (Hermes rings the phone)
+          # --------------------------------------------------------------------------
+
+
+          def tz():
+              if ZoneInfo is None:
+                  return None
+              try:
+                  return ZoneInfo(LOCAL_TZ)
+              except Exception:
+                  return None
+
+
+          def now_local():
+              return datetime.now(tz())
+
+
+          WEEKDAYS = {
+              "monday": 0, "mon": 0, "tuesday": 1, "tue": 1, "wednesday": 2, "wed": 2,
+              "thursday": 3, "thu": 3, "friday": 4, "fri": 4, "saturday": 5, "sat": 5,
+              "sunday": 6, "sun": 6,
+          }
+
+
+          def _apply_time(base, hour, minute):
+              return base.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+
+          def _find_clock(text):
+              """Pulls a time of day out of free text. Returns (hour, minute) or None."""
+              m = re.search(r"(\d{1,2})[:.](\d{2})\s*(am|pm)?", text)
+              if m:
+                  hour = int(m.group(1))
+                  minute = int(m.group(2))
+                  suffix = m.group(3)
+              else:
+                  m = re.search(r"(\d{1,2})\s*(am|pm)", text)
+                  if not m:
+                      return None
+                  hour = int(m.group(1))
+                  minute = 0
+                  suffix = m.group(2)
+              if suffix == "pm" and hour < 12:
+                  hour += 12
+              if suffix == "am" and hour == 12:
+                  hour = 0
+              if hour > 23 or minute > 59:
+                  return None
+              return hour, minute
+
+
+          def parse_when(value):
+              """
+              Turns whatever the user said into an epoch-millisecond timestamp.
+
+              Understands: epoch millis, ISO timestamps, "tomorrow 10am",
+              "today at 21:30", "in 45 minutes", "in 2 hours", "monday 9am",
+              "2026-08-08 10:00" and a bare "10am" (meaning the next 10am).
+              """
+              if value is None:
+                  return None
+              if isinstance(value, (int, float)):
+                  return int(value if value > 1e12 else value * 1000)
+
+              text = str(value).strip().lower()
+              if not text:
+                  return None
+              if text.isdigit():
+                  n = int(text)
+                  return n if n > 1e12 else n * 1000
+
+              base = now_local()
+
+              # "in 20 minutes" / "in 3 hours" / "in 2 days"
+              m = re.search(r"in\s+(\d+)\s*(min|minute|minutes|hour|hours|hr|day|days)", text)
+              if m:
+                  amount = int(m.group(1))
+                  unit = m.group(2)
+                  if unit.startswith("min"):
+                      target = base + timedelta(minutes=amount)
+                  elif unit.startswith(("hour", "hr")):
+                      target = base + timedelta(hours=amount)
+                  else:
+                      target = base + timedelta(days=amount)
+                  return int(target.timestamp() * 1000)
+
+              # ISO first - most precise when the agent formats it properly.
+              iso = text.replace("z", "").strip()
+              for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dt%H:%M:%S", "%Y-%m-%d %H:%M",
+                          "%Y-%m-%dt%H:%M", "%Y-%m-%d", "%d-%m-%Y %H:%M", "%d/%m/%Y %H:%M"):
+                  try:
+                      parsed = datetime.strptime(iso, fmt)
+                      if tz() is not None:
+                          parsed = parsed.replace(tzinfo=tz())
+                      if fmt == "%Y-%m-%d":
+                          clock = _find_clock(text) or (9, 0)
+                          parsed = _apply_time(parsed, clock[0], clock[1])
+                      return int(parsed.timestamp() * 1000)
+                  except ValueError:
+                      continue
+
+              clock = _find_clock(text)
+              hour, minute = clock if clock else (9, 0)
+
+              if "day after tomorrow" in text:
+                  target = _apply_time(base + timedelta(days=2), hour, minute)
+              elif "tomorrow" in text or "kal" in text or "agamikal" in text:
+                  target = _apply_time(base + timedelta(days=1), hour, minute)
+              elif "tonight" in text:
+                  target = _apply_time(base, hour if clock else 21, minute)
+              elif "today" in text or "aaj" in text:
+                  target = _apply_time(base, hour, minute)
+              else:
+                  weekday = None
+                  for name, index in WEEKDAYS.items():
+                      if re.search(r"\b%s\b" % name, text):
+                          weekday = index
+                          break
+                  if weekday is not None:
+                      ahead = (weekday - base.weekday()) % 7
+                      if ahead == 0:
+                          ahead = 7
+                      target = _apply_time(base + timedelta(days=ahead), hour, minute)
+                  elif clock:
+                      target = _apply_time(base, hour, minute)
+                      if target <= base:
+                          target += timedelta(days=1)
+                  else:
+                      return None
+
+              if target <= base and "today" not in text and "tonight" not in text:
+                  # A time that already passed today means the next day.
+                  if "tomorrow" not in text and "kal" not in text:
+                      target += timedelta(days=1)
+              return int(target.timestamp() * 1000)
+
+
+          def pretty_time(epoch_ms):
+              try:
+                  return datetime.fromtimestamp(epoch_ms / 1000.0, tz()).strftime(
+                      "%a %d %b %Y, %I:%M %p"
+                  )
+              except Exception:
+                  return str(epoch_ms)
+
+
+          # Filled in the first time we have to look the account up, so the lookup
+          # happens once per run rather than on every call.
+          _DISCOVERED_USER = [""]
+
+
+          def _as_number(value):
+              try:
+                  return float(value)
+              except (TypeError, ValueError):
+                  return 0.0
+
+
+          def resolve_user(user_id=""):
+              """
+              Work out which account to ring.
+
+              Order: whatever was passed in, then HERMES_USER_ID, then the most recently
+              seen real person in the database. Without this last step the agent could
+              never phone anybody on its own, because nothing in the workflow ever set
+              a user id for it to use.
+              """
+              uid = (user_id or "").strip()
+              if uid:
+                  return uid
+              if DEFAULT_USER_ID:
+                  return DEFAULT_USER_ID
+              if _DISCOVERED_USER[0]:
+                  return _DISCOVERED_USER[0]
+
+              users = db_get("users")
+              if not isinstance(users, dict):
+                  log("no user id given and the user list could not be read")
+                  return ""
+              people = []
+              for key, row in users.items():
+                  if not isinstance(row, dict):
+                      continue
+                  found = (row.get("id") or key or "").strip()
+                  if not found or found.startswith("bot_"):
+                      continue
+                  people.append((_as_number(row.get("lastSeen")), found,
+                                 row.get("name") or "unnamed"))
+              if not people:
+                  log("no user id given and no accounts were found")
+                  return ""
+              people.sort(key=lambda p: p[0], reverse=True)
+              _DISCOVERED_USER[0] = people[0][1]
+              log("no user id given, calling %s (%s)" % (people[0][1], people[0][2]))
+              return people[0][1]
+
+
+          # Remembered so a rejected invite is reported once instead of on every
+          # pass of the watch loop.
+          _IGNORED = set()
+
+          # Cached list of the bots this bridge speaks for, refreshed occasionally so a
+          # bot created while the run is live starts working without a restart.
+          _MY_BOTS = {"ids": set(), "at": 0.0}
+          BOT_REFRESH_S = 300
+
+
+          def my_bot_ids():
+              """
+              The bot ids this bridge is allowed to answer for.
+
+              Everybody shares one database but each person runs Hermes in their own
+              GitHub repo, so a bridge has to know which bots are its own. Bots live at
+              bots/{ownerUserId}/{botId}, so the owner's user id is enough to find them
+              and nothing has to be configured by hand.
+              """
+              if BOT_ID_PINNED:
+                  return set([BOT_ID])
+
+              now = time.time()
+              if _MY_BOTS["ids"] and now - _MY_BOTS["at"] < BOT_REFRESH_S:
+                  return _MY_BOTS["ids"]
+
+              # Deliberately not resolve_user(): guessing the owner from a shared
+              # database could pick somebody else and answer their calls.
+              owner = DEFAULT_USER_ID
+              if not owner:
+                  if not _MY_BOTS["at"]:
+                      log("HERMES_USER_ID is not set, so this bridge cannot tell which "
+                          "bots are its own; falling back to bot id %r" % BOT_ID)
+                  _MY_BOTS["at"] = now
+                  return set([BOT_ID])
+
+              ids = set()
+              bots = db_get("bots/%s" % owner)
+              if isinstance(bots, dict):
+                  for key, row in bots.items():
+                      found = ""
+                      if isinstance(row, dict):
+                          found = (row.get("id") or "").strip()
+                      ids.add(found or key.strip())
+              ids.discard("")
+
+              if not ids:
+                  if not _MY_BOTS["at"]:
+                      log("no bots found for owner", owner, "- falling back to", BOT_ID)
+                  _MY_BOTS["at"] = now
+                  return set([BOT_ID])
+
+              if ids != _MY_BOTS["ids"]:
+                  log("this bridge answers for bot(s):", ", ".join(sorted(ids)))
+              _MY_BOTS["ids"] = ids
+              _MY_BOTS["at"] = now
+              return ids
+
+
+          def iter_invites(bot_id, node):
+              """
+              Yield (invite, database path) pairs for one bot.
+
+              Two shapes are accepted. Older builds wrote a single invite straight to
+              hermesCalls/{botId}, which meant a second caller silently overwrote the
+              first. Current builds write hermesCalls/{botId}/{userId}, so every caller
+              gets their own slot. Both are handled so an old app still works.
+              """
+              if not isinstance(node, dict):
+                  return []
+              if "roomId" in node:
+                  return [(dict(node), "hermesCalls/%s" % bot_id)]
+              found = []
+              for user_id, invite in node.items():
+                  if isinstance(invite, dict) and invite.get("roomId"):
+                      entry = dict(invite)
+                      entry.setdefault("userId", user_id)
+                      found.append((entry, "hermesCalls/%s/%s" % (bot_id, user_id)))
+              return found
+
+
+          def is_for_us(invite, bot_id, path):
+              """True when this invite is addressed to this bridge."""
+              target = (invite.get("botId") or bot_id or "").strip()
+              caller = (invite.get("userId") or "").strip()
+              mine = my_bot_ids()
+
+              # An old app build with no bot configured writes the literal "hermes".
+              # Accept that only from our own owner, never from somebody else.
+              legacy_ours = (target == "hermes" and DEFAULT_USER_ID
+                             and caller == DEFAULT_USER_ID)
+
+              if target and not ACCEPT_ANY_BOT and target not in mine and not legacy_ours:
+                  if path not in _IGNORED:
+                      _IGNORED.add(path)
+                      log("ignoring a call for bot", target, "- this bridge answers for",
+                          ", ".join(sorted(mine)) or BOT_ID)
+                  return False
+
+              if OWNER_IDS and caller and caller not in OWNER_IDS:
+                  if path not in _IGNORED:
+                      _IGNORED.add(path)
+                      log("ignoring a call from", caller, "- not an owner of this bridge")
+                  return False
+              return True
+
+
+          def schedule_call(user_id, when, say="", topic="", repeat="once", bot_id=None):
+              """Stores a future call so it survives runner restarts."""
+              user_id = resolve_user(user_id)
+              at = parse_when(when)
+              if not user_id or at is None:
+                  return None
+              entry = {
+                  "id": "sch_%s" % uuid.uuid4().hex[:8],
+                  "userId": user_id,
+                  "at": at,
+                  "say": say or "",
+                  "topic": topic or "",
+                  "repeat": (repeat or "once").lower(),
+                  "botId": bot_id or os.environ.get("HERMES_BOT_ID", "hermes"),
+                  "status": "pending",
+                  "attempts": 0,
+                  "createdAt": int(time.time() * 1000),
+                  "humanTime": pretty_time(at),
+              }
+              if db_put("hermesSchedule/%s" % entry["id"], entry):
+                  log("scheduled call", entry["id"], "for", entry["humanTime"])
+                  return entry
+              return None
+
+
+          def list_schedule():
+              items = db_get("hermesSchedule") or {}
+              out = [v for v in items.values() if isinstance(v, dict)]
+              return sorted(out, key=lambda x: x.get("at", 0))
+
+
+          def cancel_schedule(entry_id):
+              if not entry_id:
+                  return False
+              if entry_id in ("all", "*"):
+                  for item in list_schedule():
+                      db_delete("hermesSchedule/%s" % item.get("id"))
+                  return True
+              return db_delete("hermesSchedule/%s" % entry_id)
+
+
+          def due_schedules():
+              """Returns the entries that should be called right now."""
+              now_ms = int(time.time() * 1000)
+              ready = []
+              for item in list_schedule():
+                  if item.get("status") != "pending":
+                      continue
+                  at = item.get("at", 0)
+                  if at > now_ms:
+                      continue
+                  late_min = (now_ms - at) / 60000.0
+                  if late_min > LATE_GRACE_MIN:
+                      # The runner was down for too long; do not surprise the user with
+                      # a call hours after the fact - just mark it and move on.
+                      item["status"] = "missed"
+                      db_put("hermesSchedule/%s" % item["id"], item)
+                      log("schedule missed by", int(late_min), "minutes:", item["id"])
+                      continue
+                  ready.append(item)
+              return ready
+
+
+          def complete_schedule(item, outcome):
+              """Marks a schedule done, or rolls it forward when it repeats."""
+              repeat = (item.get("repeat") or "once").lower()
+              if repeat in ("daily", "weekly", "weekday") and outcome != "cancelled":
+                  step = timedelta(days=1) if repeat != "weekly" else timedelta(days=7)
+                  nxt = datetime.fromtimestamp(item["at"] / 1000.0, tz()) + step
+                  if repeat == "weekday":
+                      while nxt.weekday() >= 5:
+                          nxt += timedelta(days=1)
+                  item["at"] = int(nxt.timestamp() * 1000)
+                  item["humanTime"] = pretty_time(item["at"])
+                  item["status"] = "pending"
+                  item["attempts"] = 0
+                  db_put("hermesSchedule/%s" % item["id"], item)
+                  log("repeating call moved to", item["humanTime"])
+                  return
+              item["status"] = outcome
+              item["completedAt"] = int(time.time() * 1000)
+              db_put("hermesSchedule/%s" % item["id"], item)
+
+
+          def new_room_id():
+              return "room_%s" % uuid.uuid4().hex[:12]
+
+
+          def ring_user(user_id, room_id, bot_id, bot_name):
+              """
+              Writes the ring node the app is already listening on, exactly in the shape
+              of the app's CallSession model. callType VOICE plus a roomId is what makes
+              the phone open the real live call screen instead of a TTS playback.
+              """
+              session = {
+                  "callId": "call_%s" % uuid.uuid4().hex[:8],
+                  "callerId": bot_id,
+                  "callerName": bot_name,
+                  "callerAvatar": "",
+                  "recipientId": user_id,
+                  "callType": "VOICE",
+                  "status": "RINGING",
+                  "ttsText": "",
+                  "ttsAudioUrl": "",
+                  "ttsAudioBase64": "",
+                  "timestamp": int(time.time() * 1000),
+                  "durationSeconds": 0,
+                  "roomId": room_id,
+                  "groupId": "",
+                  "groupName": "",
+              }
+              db_delete("calls/%s" % user_id)
+              return db_put("calls/%s" % user_id, session)
+
+
+          def queue_outgoing(user_id, say="", bot_id=None, bot_name=None, topic=""):
+              """Adds an outgoing call request to the queue the main loop drains."""
+              user_id = resolve_user(user_id)
+              if not user_id:
+                  log("cannot place the call - no user id and none could be discovered")
+                  return False
+              with PENDING_LOCK:
+                  PENDING.append({
+                      "userId": user_id,
+                      "say": say or "",
+                      "botId": bot_id or os.environ.get("HERMES_BOT_ID", "hermes"),
+                      "botName": bot_name or AGENT_NAME,
+                      "topic": topic or "",
+                      "outgoing": True,
+                  })
+              return True
+
+
+          class ControlHandler(BaseHTTPRequestHandler):
+              """
+              Tiny local endpoint so Hermes itself can start a call with one curl:
+
+                  curl -X POST http://localhost:7788/call \
+                       -d '{"user":"USER_ID","say":"Your build finished"}'
+              """
+
+              def _reply(self, code, payload):
+                  body = json.dumps(payload).encode()
+                  self.send_response(code)
+                  self.send_header("Content-Type", "application/json")
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+
+              def do_GET(self):
+                  if self.path.startswith("/schedules"):
+                      self._reply(200, {"ok": True, "schedules": list_schedule()})
+                      return
+                  self._reply(200, {"ok": True, "service": "hermes-live-call"})
+
+              def do_POST(self):
+                  try:
+                      length = int(self.headers.get("Content-Length", 0))
+                      raw = self.rfile.read(length).decode() if length else "{}"
+                      try:
+                          data = json.loads(raw)
+                      except Exception:
+                          # Also accept plain form style: user=...&say=...
+                          data = dict(
+                              part.split("=", 1) for part in raw.split("&") if "=" in part
+                          )
+                      user = data.get("user") or data.get("userId") or ""
+                      say = data.get("say") or data.get("text") or ""
+                      topic = data.get("topic") or data.get("about") or ""
+
+                      # ---- cancel a scheduled call --------------------------------
+                      if self.path.startswith("/cancel"):
+                          target = data.get("id") or data.get("schedule") or ""
+                          ok = cancel_schedule(target)
+                          self._reply(200 if ok else 400, {"ok": ok, "cancelled": target})
+                          return
+
+                      # ---- book a call for later ----------------------------------
+                      if self.path.startswith("/schedule"):
+                          when = data.get("when") or data.get("at") or data.get("time") or ""
+                          entry = schedule_call(
+                              user,
+                              when,
+                              say,
+                              topic,
+                              data.get("repeat", "once"),
+                              data.get("botId"),
+                          )
+                          if entry is None:
+                              self._reply(400, {
+                                  "ok": False,
+                                  "error": "could not understand the time or user id",
+                                  "got": {"user": user, "when": when},
+                              })
+                          else:
+                              self._reply(200, {
+                                  "ok": True,
+                                  "id": entry["id"],
+                                  "at": entry["at"],
+                                  "humanTime": entry["humanTime"],
+                              })
+                          return
+
+                      # ---- ring right now -----------------------------------------
+                      ok = queue_outgoing(
+                          user,
+                          say,
+                          data.get("botId"),
+                          data.get("botName"),
+                          topic,
+                      )
+                      log("outgoing call requested for", user)
+                      self._reply(200 if ok else 400, {"ok": ok, "user": user})
+                  except Exception as exc:
+                      self._reply(500, {"ok": False, "error": str(exc)})
+
+              def log_message(self, *args):
+                  pass
+
+
+          def start_control_server():
+              try:
+                  server = HTTPServer(("127.0.0.1", CONTROL_PORT), ControlHandler)
+              except Exception as exc:
+                  log("control port unavailable", exc)
+                  return
+              threading.Thread(target=server.serve_forever, daemon=True).start()
+              log("control endpoint on http://127.0.0.1:%d/call" % CONTROL_PORT)
+
+
+          # --------------------------------------------------------------------------
+          # speech to text / text to speech / talking to Hermes
+          # --------------------------------------------------------------------------
+
+
+          def pcm_to_wav(pcm16, rate=STT_RATE):
+              buf = io.BytesIO()
+              with wave.open(buf, "wb") as w:
+                  w.setnchannels(1)
+                  w.setsampwidth(2)
+                  w.setframerate(rate)
+                  w.writeframes(pcm16)
+              return buf.getvalue()
+
+
+          def transcribe(pcm16):
+              """Groq Whisper. Returns the recognised text, or an empty string."""
+              if not GROQ_KEY:
+                  log("no GROQ_API_KEY - cannot transcribe")
+                  return ""
+              wav = pcm_to_wav(pcm16)
+              try:
+                  r = requests.post(
+                      "https://api.groq.com/openai/v1/audio/transcriptions",
+                      headers={"Authorization": "Bearer %s" % GROQ_KEY},
+                      files={"file": ("speech.wav", wav, "audio/wav")},
+                      data={"model": STT_MODEL, "response_format": "json"},
+                      timeout=90,
+                  )
+                  if r.status_code != 200:
+                      log("stt http", r.status_code, r.text[:200])
+                      return ""
+                  return (r.json().get("text") or "").strip()
+              except Exception as exc:
+                  log("stt failed", exc)
+                  return ""
+
+
+          EMOJI_RE = re.compile(
+              "[\U00010000-\U0010ffff\u2190-\u21ff\u2600-\u27bf\ufe0f\u2b00-\u2bff]",
+              flags=re.UNICODE,
+          )
+
+          # Whisper invents these out of silence and background hum. Answering them is
+          # what makes the agent babble, so an utterance that is only this is dropped.
+          NOISE_TRANSCRIPTS = {
+              "", ".", "..", "...", "you", "thank you", "thankyou", "thanks for watching",
+              "subtitles by the amaraorg community", "please subscribe", "uh", "um",
+              "umm", "hmm", "mm", "mhm", "ah", "eh", "oh", "bye bye",
+          }
+
+          SYSTEM_PROMPT = (
+              "You are Hermes and you are on a live phone call. Speak the way a person "
+              "speaks on the phone: one to three short sentences of plain spoken words. "
+              "Never use markdown, bullet points, numbered lists, headings, code blocks, "
+              "emoji or stage directions. Never repeat anything you already said in this "
+              "call. Never read the conversation back to the caller and never restate "
+              "their question. Reply only to the very last thing they said. If you did "
+              "not understand, say so in one short sentence and ask them to repeat."
+          )
+
+
+          # Anything that asks for something to actually *happen* has to go through
+          # the Hermes CLI, which is the build that owns the browser, the shell and
+          # the file system. The stateless pool can only talk.
+          ACTION_WORDS = (
+              r"open|launch|start|run|execute|browse|browser|chrome|firefox|google|"
+              r"search|look up|find out|go to|visit|download|upload|install|update|"
+              r"screenshot|screen shot|click|type|scroll|terminal|command|shell|"
+              r"script|file|folder|directory|create|make|write|delete|remove|move|"
+              r"copy|rename|check|read|send|email|mail|post|push|commit|deploy|"
+              r"build|compile|restart|reboot|shutdown|kill|stop|play|remind|"
+              r"schedule|book|desktop|computer|pc|machine|system|vnc|youtube|"
+              r"github|repo|repository|website|site|url|link|log|logs|status"
+          )
+          ACTION_RE = re.compile(r"\b(%s)\b" % ACTION_WORDS, re.I)
+          # Bangla has no usable word boundaries, so these match as plain substrings.
+          BANGLA_ACTION_RE = re.compile(
+              u"\u0996\u09cb\u09b2|\u099a\u09be\u09b2\u09c1|\u099a\u09be\u09b2\u09be|"
+              u"\u09ac\u09a8\u09cd\u09a7|\u09a1\u09be\u0989\u09a8\u09b2\u09cb\u09a1|"
+              u"\u0987\u09a8\u09b8\u09cd\u099f\u09b2|\u09b8\u09be\u09b0\u09cd\u099a|"
+              u"\u0996\u09c1\u0981\u099c|\u09a6\u09c7\u0996|\u09aa\u09be\u09a0\u09be|"
+              u"\u09ac\u09be\u09a8\u09be|\u09a4\u09c8\u09b0\u09bf|\u09b2\u09bf\u0996|"
+              u"\u09ae\u09c1\u099b|\u09a1\u09bf\u09b2\u09bf\u099f|\u099a\u09c7\u0995|"
+              u"\u09ac\u09bf\u09b2\u09cd\u09a1|\u0995\u09ae\u09be\u09a8\u09cd\u09a1|"
+              u"\u09ac\u09cd\u09b0\u09be\u0989\u099c\u09be\u09b0|"
+              u"\u0995\u09ae\u09cd\u09aa\u09bf\u0989\u099f\u09be\u09b0|"
+              u"\u09ab\u09be\u0987\u09b2|\u09ab\u09cb\u09b2\u09cd\u09a1\u09be\u09b0|"
+              u"\u09b8\u09cd\u0995\u09cd\u09b0\u09bf\u09a8\u09b6\u099f"
+          )
+
+
+          def needs_agent(text):
+              """True when the caller asked for something to be done, not discussed."""
+              if not text:
+                  return False
+              return bool(ACTION_RE.search(text) or BANGLA_ACTION_RE.search(text))
+
+
+          def holding_line(text):
+              """Something to say so the line is not dead while a task runs."""
+              if detect_language(text) == "bn":
+                  return (
+                      u"\u09a0\u09bf\u0995 \u0986\u099b\u09c7, "
+                      u"\u098f\u0995\u099f\u09c1 \u09b8\u09ae\u09df \u09a6\u09bf\u09a8\u0964"
+                  )
+              return "On it. Give me a moment."
+
+
+          def meaningful(text):
+              """False for the filler Whisper hallucinates when nobody is speaking."""
+              stripped = re.sub(r"[^0-9a-z\u0980-\u09ff ]", "", (text or "").lower()).strip()
+              stripped = re.sub(r"\s+", " ", stripped)
+              if len(stripped) < 2:
+                  return False
+              return stripped not in NOISE_TRANSCRIPTS
+
+
+          def clean_reply(text, history=()):
+              """
+              Turns whatever the model produced into something worth speaking aloud:
+              no markdown, no role labels, no transcript echo, no repetition of a line
+              Hermes already said, and never longer than a few sentences.
+              """
+              if not text:
+                  return ""
+              out = text.strip()
+              out = re.sub(r"```.*?```", " ", out, flags=re.S)          # code fences
+              out = re.sub(r"`([^`]*)`", r"\1", out)
+              out = re.sub(r"<think>.*?</think>", " ", out, flags=re.S)  # reasoning dumps
+              out = re.sub(r"<[^>]+>", " ", out)
+              # a role label the CLI sometimes prints in front of the answer
+              out = re.sub(r"^\s*(assistant|hermes|ai|bot|answer|response|reply)\s*[:\-]\s*",
+                           "", out, flags=re.I)
+              # whole lines that just replay the conversation
+              out = re.sub(r"^\s*(user|caller|you|me|human)\s*[:\-].*$", "",
+                           out, flags=re.I | re.M)
+              out = re.sub(r"^\s*(assistant|hermes)\s*[:\-]\s*", "", out, flags=re.I | re.M)
+              out = re.sub(r"^\s*#{1,6}\s*", "", out, flags=re.M)         # headings
+              out = re.sub(r"^\s*[-*\u2022]\s+", "", out, flags=re.M)      # bullets
+              out = re.sub(r"^\s*\d+[.)]\s+", "", out, flags=re.M)         # numbering
+              out = re.sub(r"\*\*([^*]*)\*\*", r"\1", out)
+              out = re.sub(r"\*([^*]*)\*", r"\1", out)
+              out = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", out)          # links
+              out = EMOJI_RE.sub("", out)
+              out = re.sub(r"\s+", " ", out).strip()
+              if not out:
+                  return ""
+
+              spoken = set()
+              for who, line in history:
+                  if who == "hermes":
+                      for piece in re.split(r"(?<=[.!?\u0964])\s+", line):
+                          piece = piece.strip().lower()
+                          if piece:
+                              spoken.add(piece)
+
+              kept = []
+              seen = set()
+              for sentence in re.split(r"(?<=[.!?\u0964])\s+", out):
+                  sentence = sentence.strip()
+                  if not sentence:
+                      continue
+                  key = sentence.lower()
+                  if key in seen or key in spoken:
+                      continue          # already said, do not say it twice
+                  seen.add(key)
+                  kept.append(sentence)
+                  if len(kept) >= MAX_SENTENCES:
+                      break
+              out = " ".join(kept).strip()
+
+              if len(out) > MAX_REPLY_CHARS:
+                  cut = out[:MAX_REPLY_CHARS]
+                  stop = max(cut.rfind("."), cut.rfind("!"), cut.rfind("?"))
+                  out = cut[: stop + 1] if stop > 60 else cut.rstrip(" ,;:") + "."
+              return out.strip()
+
+
+          def _ask_pool(messages):
+              r = requests.post(
+                  "%s/chat/completions" % POOL_URL,
+                  json={
+                      "model": POOL_MODEL,
+                      "messages": messages,
+                      "max_tokens": 160,
+                      "temperature": 0.6,
+                  },
+                  timeout=90,
+              )
+              if r.status_code != 200:
+                  log("pool http", r.status_code, r.text[:200])
+                  return ""
+              return (r.json()["choices"][0]["message"]["content"] or "").strip()
+
+
+          def _ask_cli(system, history, text, timeout=None):
+              recap = " ".join(
+                  "%s said: %s" % ("The caller" if who == "user" else "You", line)
+                  for who, line in list(history)[-4:]
+              )
+              prompt = system
+              if recap:
+                  prompt += " Earlier in this call, " + recap
+              prompt += (
+                  " The caller just said: %s. Reply out loud with your answer only." % text
+              )
+              out = subprocess.run(
+                  shlex.split(CHAT_CMD) + [prompt],
+                  capture_output=True,
+                  text=True,
+                  timeout=timeout or CHAT_TIMEOUT,
+              )
+              answer = (out.stdout or "").strip()
+              if not answer:
+                  log("hermes cli empty", (out.stderr or "")[:200])
+              return answer
+
+
+          def ask_hermes(text, user_name, topic="", history=()):
+              """Send the caller's last line to Hermes and return the spoken answer."""
+              about = " This call is about: %s." % topic if topic else ""
+              system = SYSTEM_PROMPT + " You are talking to %s.%s" % (
+                  user_name or "the caller", about
+              )
+
+              messages = [{"role": "system", "content": system}]
+              for who, line in list(history)[-HISTORY_TURNS * 2:]:
+                  messages.append(
+                      {"role": "assistant" if who == "hermes" else "user", "content": line}
+                  )
+              messages.append({"role": "user", "content": text})
+
+              # A request to *do* something must reach the CLI, tools and all. Small
+              # talk stays on the stateless pool, which answers faster and cannot drag
+              # an unrelated chat session into the call.
+              agentic = needs_agent(text)
+              if agentic:
+                  system += (
+                      " The caller is asking you to actually do something on this "
+                      "computer. Use your tools to do it now, then say in one or two "
+                      "short sentences what you did or what you found. Do not read out "
+                      "commands, paths or raw output."
+                  )
+                  messages[0]["content"] = system
+                  order = ["cli"]
+              elif CALL_BACKEND == "cli":
+                  order = ["cli", "pool"]
+              elif CALL_BACKEND == "pool":
+                  order = ["pool"]
+              else:
+                  order = ["pool", "cli"]
+
+              for backend in order:
+                  try:
+                      if backend == "pool":
+                          answer = _ask_pool(messages)
+                      else:
+                          answer = _ask_cli(
+                              system, history, text,
+                              AGENT_TIMEOUT if agentic else CHAT_TIMEOUT,
+                          )
+                      if answer:
+                          return answer
+                  except subprocess.TimeoutExpired:
+                      log("%s backend timed out" % backend)
+                      if agentic:
+                          return "That is taking a while. I will keep working on it."
+                  except Exception as exc:
+                      log("%s backend failed" % backend, exc)
+              if agentic:
+                  return "I could not finish that one. Want me to try a different way?"
+              return "Sorry, I did not catch that. Could you say it again?"
+
+
+          def detect_language(text):
+              """"bn" when the text is meaningfully Bangla, otherwise "en"."""
+              if not text:
+                  return "en"
+              bengali = len(BENGALI_RE.findall(text))
+              if not bengali:
+                  return "en"
+              letters = len([c for c in text if c.isalpha()])
+              # A stray Bangla character inside an English sentence should not flip the
+              # whole line over to the Bangla voice.
+              return "bn" if letters and bengali / float(letters) >= 0.30 else "en"
+
+
+          def split_by_language(text):
+              """
+              Break a reply into consecutive same-language runs.
+
+              Hermes often answers in Banglish - an English sentence followed by a Bangla
+              one. Speaking the whole thing with one voice mangles half of it, so each
+              sentence is routed to the voice that belongs to it and the audio is joined
+              back together seamlessly.
+              """
+              parts = [p for p in re.split(r"(?<=[.!?\u0964])\s+", text or "") if p.strip()]
+              if not parts:
+                  return []
+              runs = []
+              for part in parts:
+                  lang = detect_language(part)
+                  if runs and runs[-1][0] == lang:
+                      runs[-1][1] = runs[-1][1] + " " + part.strip()
+                  else:
+                      runs.append([lang, part.strip()])
+              return [(lang, chunk) for lang, chunk in runs]
+
+
+          def _to_call_pcm(raw, in_rate=None, from_file=None):
+              """Whatever the engine produced -> 48 kHz mono s16le the call can carry."""
+              cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
+              if from_file:
+                  cmd += ["-i", from_file]
+              else:
+                  cmd += ["-f", "s16le", "-ar", str(in_rate), "-ac", "1", "-i", "-"]
+              cmd += ["-f", "s16le", "-acodec", "pcm_s16le",
+                      "-ar", str(SAMPLE_RATE), "-ac", "1", "-"]
+              out = subprocess.run(
+                  cmd, input=None if from_file else raw, capture_output=True, timeout=120
+              )
+              return out.stdout or b""
+
+
+          def _piper_rate():
+              """Piper models carry their sample rate in a sidecar json."""
+              try:
+                  with io.open(PIPER_MODEL + ".json", encoding="utf-8") as fh:
+                      return int(json.load(fh)["audio"]["sample_rate"])
+              except Exception:
+                  return 22050
+
+
+          def piper_available():
+              return bool(shutil.which(PIPER_BIN)) and os.path.exists(PIPER_MODEL)
+
+
+          def _speak_local(text):
+              """Local Piper neural voice. Fast enough to feel instant."""
+              if not piper_available():
+                  return b""
+              try:
+                  out = subprocess.run(
+                      [PIPER_BIN, "--model", PIPER_MODEL, "--output_raw"],
+                      input=text.encode("utf-8"),
+                      capture_output=True,
+                      timeout=120,
+                  )
+                  if not out.stdout:
+                      log("piper produced nothing", (out.stderr or b"")[:160])
+                      return b""
+                  return _to_call_pcm(out.stdout, in_rate=_piper_rate())
+              except Exception as exc:
+                  log("piper failed", exc)
+                  return b""
+
+
+          def _speak_edge(text, voice):
+              """Microsoft neural voices through edge-tts."""
+              mp3 = "/tmp/hermes_call_%s.mp3" % uuid.uuid4().hex[:8]
+              try:
+                  subprocess.run(
+                      ["edge-tts", "--voice", voice, "--text", text, "--write-media", mp3],
+                      capture_output=True,
+                      timeout=120,
+                  )
+                  if not os.path.exists(mp3) or os.path.getsize(mp3) == 0:
+                      log("edge-tts produced nothing for voice", voice)
+                      return b""
+                  return _to_call_pcm(None, from_file=mp3)
+              except Exception as exc:
+                  log("edge-tts failed", exc)
+                  return b""
+              finally:
+                  try:
+                      os.remove(mp3)
+                  except Exception:
+                      pass
+
+
+          def _fade_edges(pcm, ms=FADE_MS):
+              """Ramp the first and last few milliseconds in and out of silence."""
+              step = 480                       # 5 ms at 48 kHz, always an even count
+              slices = max(1, int(SAMPLE_RATE * 2 * ms / 1000.0) // step)
+              if len(pcm) < step * slices * 2:
+                  return pcm
+              out = bytearray(pcm)
+              for i in range(slices):
+                  gain = (i + 1) / float(slices + 1)
+                  head = i * step
+                  out[head:head + step] = audioop.mul(bytes(out[head:head + step]), 2, gain)
+                  tail = len(out) - (i + 1) * step
+                  out[tail:tail + step] = audioop.mul(bytes(out[tail:tail + step]), 2, gain)
+              return bytes(out)
+
+
+          def synthesize(text):
+              """
+              Speak a reply, switching voice per language.
+
+                  English -> local Piper female voice, edge-tts female as a fallback
+                  Bangla  -> Bangla female voice through edge-tts
+
+              Returns 48 kHz mono signed 16 bit PCM ready to push into the call.
+              """
+              if not text:
+                  return b""
+              audio = bytearray()
+              gap = b"\x00" * (int(SAMPLE_RATE * 2 * SEGMENT_GAP_MS / 1000.0) & ~1)
+              for lang, chunk in split_by_language(text):
+                  if lang == "bn":
+                      piece = _speak_edge(chunk, TTS_VOICE_BN)
+                  else:
+                      piece = _speak_local(chunk) or _speak_edge(chunk, TTS_VOICE_EN)
+                  if not piece:
+                      log("no audio for a", lang, "segment")
+                      continue
+                  if audio:
+                      audio.extend(gap)
+                  # Two engines end and begin at different levels; butting the buffers
+                  # straight together is what produced the clicks between sentences.
+                  audio.extend(_fade_edges(piece))
+              if audio:
+                  audio.extend(b"\x00" * (int(SAMPLE_RATE * 2 * TAIL_PAD_MS / 1000.0) & ~1))
+              return bytes(audio)
+
+
+          # --------------------------------------------------------------------------
+          # voice activity detection
+          # --------------------------------------------------------------------------
+
+
+          def zero_crossing_rate(pcm16):
+              """Fraction of samples where the waveform crosses zero.
+
+              A human voice lands around 0.03 - 0.25. Wind, rumble and handling noise
+              sit far below that; hiss, static and keyboard clicks sit far above it.
+              This one number rejects most of what is not a person talking.
+              """
+              samples = len(pcm16) // 2
+              if samples < 2:
+                  return 0.0
+              try:
+                  return audioop.cross(pcm16, 2) / float(samples)
+              except Exception:
+                  return 0.0
+
+
+          class SpeechGate:
+              """
+              Adaptive gate that decides whether a 20 ms frame is a person speaking.
+
+              Three independent tests must agree, which is what keeps a fan, a busy
+              street or wind across the microphone from ever triggering it:
+
+                1. loudness  - well above the *measured* noise floor of this room,
+                               not above some fixed number that breaks everywhere else
+                2. timbre    - zero-crossing rate inside the human speech band
+                3. modulation- the level actually moves; steady noise never does
+
+              The floor keeps learning while nobody talks, so a noisy room simply
+              raises the bar instead of producing false interruptions.
+              """
+
+              def __init__(self):
+                  self.floor = float(SILENCE_RMS)
+                  self.recent = collections.deque(maxlen=25)   # ~500 ms of levels
+
+              def observe(self, pcm16):
+                  rms = audioop.rms(pcm16, 2)
+                  self.recent.append(rms)
+                  return rms, zero_crossing_rate(pcm16)
+
+              def adapt(self, rms):
+                  """Follow the room. Drops fast, rises slowly, never runs away."""
+                  rate = NOISE_ADAPT if rms > self.floor else NOISE_ADAPT * 4
+                  self.floor = (1.0 - rate) * self.floor + rate * rms
+                  self.floor = max(60.0, min(self.floor, 5000.0))
+
+              @property
+              def modulated(self):
+                  if len(self.recent) < 8:
+                      return False
+                  quiet = min(self.recent)
+                  loud = max(self.recent)
+                  return loud > (quiet + 1) * MODULATION_MIN
+
+              def is_speech(self, rms, zcr, factor, minimum):
+                  if rms <= max(minimum, self.floor * factor):
+                      return False
+                  return ZCR_MIN <= zcr <= ZCR_MAX
+
+
+          # --------------------------------------------------------------------------
+          # outbound audio track: whatever we push into it is what the user hears
+          # --------------------------------------------------------------------------
+
+
+          class HermesVoiceTrack(MediaStreamTrack):
+              kind = "audio"
+
+              def __init__(self):
+                  super().__init__()
+                  self._queue = bytearray()
+                  self._lock = asyncio.Lock()
+                  self._pts = 0
+                  self._start = None
+                  # Level of the frame we last sent. The listener measures the caller's
+                  # microphone against this to tell real speech from our own voice
+                  # echoing back through their speaker.
+                  self.out_rms = 0
+                  self.speaking_since = 0.0
+
+              async def say(self, pcm16):
+                  async with self._lock:
+                      if not self._queue:
+                          self.speaking_since = time.time()
+                      self._queue.extend(pcm16)
+
+              async def stop_speaking(self):
+                  async with self._lock:
+                      self._queue.clear()
+                      self.speaking_since = 0.0
+
+              @property
+              def speaking_ms(self):
+                  if not self.speaking_since:
+                      return 0.0
+                  return (time.time() - self.speaking_since) * 1000.0
+
+              @property
+              def speaking(self):
+                  return len(self._queue) > 0
+
+              async def recv(self):
+                  if self._start is None:
+                      self._start = time.time()
+                  self._pts += FRAME_SAMPLES
+                  target = self._start + self._pts / float(SAMPLE_RATE)
+                  wait = target - time.time()
+                  if wait > 0:
+                      await asyncio.sleep(wait)
+                  elif wait < -DRIFT_RESYNC_S:
+                      # We fell a long way behind, usually because something blocked the
+                      # loop. Re-anchor the clock instead of firing off a burst of late
+                      # frames, which is exactly what makes the voice sound chopped.
+                      log("audio clock drifted %d ms, resyncing" % int(-wait * 1000))
+                      self._start = time.time() - self._pts / float(SAMPLE_RATE)
+
+                  need = FRAME_SAMPLES * 2
+                  async with self._lock:
+                      if len(self._queue) >= need:
+                          chunk = bytes(self._queue[:need])
+                          del self._queue[:need]
+                      else:
+                          chunk = bytes(self._queue) + b"\x00" * (need - len(self._queue))
+                          self._queue.clear()
+                          self.speaking_since = 0.0
+                  try:
+                      self.out_rms = audioop.rms(chunk, 2)
+                  except Exception:
+                      self.out_rms = 0
+
+                  frame = av.AudioFrame(format="s16", layout="mono", samples=FRAME_SAMPLES)
+                  frame.planes[0].update(chunk)
+                  frame.sample_rate = SAMPLE_RATE
+                  frame.pts = self._pts - FRAME_SAMPLES
+                  frame.time_base = fractions.Fraction(1, SAMPLE_RATE)
+                  return frame
+
+
+          # --------------------------------------------------------------------------
+          # one call
+          # --------------------------------------------------------------------------
+
+
+          class HermesCall:
+              def __init__(self, invite):
+                  self.room = invite["roomId"]
+                  self.bot_id = invite.get("botId") or "hermes"
+                  self.user_id = invite.get("userId") or ""
+                  # Exactly the node this invite was read from, so cleaning up after
+                  # the call cannot remove another caller's pending invite.
+                  self.invite_path = invite.get("invitePath") or (
+                      "hermesCalls/%s" % self.bot_id
+                  )
+                  self.user_name = invite.get("userName") or "there"
+                  self.self_id = "hermes_%s" % self.bot_id
+                  self.pair = (
+                      "%s__%s" % (self.self_id, self.user_id)
+                      if self.self_id < self.user_id
+                      else "%s__%s" % (self.user_id, self.self_id)
+                  )
+                  self.am_offerer = self.self_id < self.user_id
+                  self.pc = None
+                  self.voice = HermesVoiceTrack()
+                  self.done = asyncio.Event()
+                  self.remote_set = False
+                  self.cand_index = 0
+                  self.seen_candidates = set()
+                  # True when Hermes is the one placing the call.
+                  self.outgoing = bool(invite.get("outgoing"))
+                  self.opening_line = invite.get("say") or ""
+                  # What this call is supposed to be about, so Hermes stays on subject.
+                  self.topic = invite.get("topic") or ""
+                  self.schedule = invite.get("schedule")
+                  # What has actually been said on this call, so the model gets real
+                  # context instead of replaying an unrelated chat session.
+                  self.history = []
+                  # The reply currently being produced; cancelled on a barge-in.
+                  self.reply_task = None
+
+              # ------------------------------------------------------------ signalling
+
+              def link(self, leaf):
+                  return "rtc/%s/links/%s/%s" % (self.room, self.pair, leaf)
+
+              def join_room(self):
+                  db_put(
+                      "rtc/%s/participants/%s" % (self.room, self.self_id),
+                      {
+                          "id": self.self_id,
+                          "name": AGENT_NAME,
+                          "avatar": "",
+                          "joinedAt": int(time.time() * 1000),
+                      },
+                  )
+                  db_put("rtc/%s/state" % self.room, "accepted")
+
+              def leave_room(self):
+                  db_delete("rtc/%s/participants/%s" % (self.room, self.self_id))
+                  db_delete(self.invite_path)
+
+              async def publish_local_description(self):
+                  desc = self.pc.localDescription
+                  db_put(self.link(desc.type), {"type": desc.type, "sdp": desc.sdp})
+
+              async def poll_signalling(self):
+                  """Reads the peer's SDP and trickled ICE candidates."""
+                  while not self.done.is_set():
+                      try:
+                          if not self.remote_set:
+                              leaf = "answer" if self.am_offerer else "offer"
+                              body = db_get(self.link(leaf))
+                              if body and body.get("sdp"):
+                                  await self.pc.setRemoteDescription(
+                                      RTCSessionDescription(sdp=body["sdp"], type=leaf)
+                                  )
+                                  self.remote_set = True
+                                  log("remote", leaf, "applied")
+                                  if not self.am_offerer:
+                                      answer = await self.pc.createAnswer()
+                                      await self.pc.setLocalDescription(answer)
+                                      await self.publish_local_description()
+
+                          if self.remote_set:
+                              cands = db_get(self.link("cand_%s" % self.user_id)) or {}
+                              for key, c in sorted(cands.items()):
+                                  if key in self.seen_candidates:
+                                      continue
+                                  self.seen_candidates.add(key)
+                                  try:
+                                      raw = c.get("candidate", "")
+                                      if raw.startswith("candidate:"):
+                                          raw = raw[len("candidate:"):]
+                                      ice = candidate_from_sdp(raw)
+                                      ice.sdpMid = c.get("sdpMid")
+                                      ice.sdpMLineIndex = c.get("sdpMLineIndex")
+                                      await self.pc.addIceCandidate(ice)
+                                  except Exception as exc:
+                                      log("bad candidate", exc)
+
+                          # hang up when the user leaves or ends the room
+                          state = db_get("rtc/%s/state" % self.room)
+                          if state in ("ended", "declined"):
+                              log("room state", state)
+                              self.done.set()
+                              break
+                          people = db_get("rtc/%s/participants" % self.room) or {}
+                          if self.user_id and self.user_id not in people and self.remote_set:
+                              log("user left the room")
+                              self.done.set()
+                              break
+                      except Exception as exc:
+                          log("signalling loop", exc)
+                      await asyncio.sleep(1.2)
+
+              # ------------------------------------------------------------ audio loop
+
+              async def speak(self, text):
+                  """Synthesise off the event loop, then hand the audio to the track."""
+                  if not text:
+                      return
+                  loop = asyncio.get_event_loop()
+                  audio = await loop.run_in_executor(None, synthesize, text)
+                  if audio:
+                      await self.voice.say(audio)
+
+              async def interrupt(self):
+                  """Caller started talking: go quiet immediately and drop the reply."""
+                  await self.voice.stop_speaking()
+                  task = self.reply_task
+                  self.reply_task = None
+                  if task is not None and not task.done():
+                      task.cancel()
+
+              def spawn_reply(self, pcm16):
+                  task = self.reply_task
+                  if task is not None and not task.done():
+                      task.cancel()
+                  self.reply_task = asyncio.ensure_future(self.handle_utterance(pcm16))
+
+              async def listen(self, track):
+                  """
+                  Listen to the caller, answer, and speak the answer back.
+
+                  While Hermes is talking the gate stays armed. If the caller genuinely
+                  starts speaking - loud enough against the live noise floor, in the human
+                  zero-crossing band, modulated, and held for BARGE_MIN_MS - playback stops
+                  instantly, the half-finished reply is cancelled, and the words that
+                  triggered the interruption are kept from the pre-roll so the first
+                  syllable is never lost. Wind, fans and street noise fail at least one of
+                  those tests, so they can never cut Hermes off.
+                  """
+                  resampler = av.AudioResampler(format="s16", layout="mono", rate=STT_RATE)
+                  gate = SpeechGate()
+                  preroll = collections.deque(maxlen=max(1, int(PREROLL_MS / 20)))
+                  speech = bytearray()
+                  speech_ms = 0.0
+                  silence_ms = 0.0
+                  barge_ms = 0.0
+                  min_bytes = int(STT_RATE * 2 * MIN_SPEECH_MS / 1000.0)
+
+                  opening = self.opening_line
+                  if not opening and self.topic:
+                      opening = (
+                          "Hi, this is the call we booked about %s. Ready when you are."
+                          % self.topic
+                      )
+                  opening = opening or GREETING
+                  self.history.append(("hermes", opening))
+                  await self.speak(opening)
+
+                  while not self.done.is_set():
+                      try:
+                          frame = await asyncio.wait_for(track.recv(), timeout=30)
+                      except asyncio.TimeoutError:
+                          continue
+                      except Exception:
+                          break
+
+                      for chunk in resampler.resample(frame):
+                          pcm = bytes(chunk.planes[0])[: chunk.samples * 2]
+                          if not pcm:
+                              continue
+                          ms = (chunk.samples / float(STT_RATE)) * 1000.0
+                          rms, zcr = gate.observe(pcm)
+
+                          # ------------------------------------- Hermes is speaking
+                          if self.voice.speaking:
+                              # Their microphone hears Hermes coming back out of
+                              # their own speaker. That echo is loud, modulated and sits
+                              # in the speech band, so on its own every test below would
+                              # call it an interruption and cut the sentence in half.
+                              # Real speech has to beat our own output level by a clear
+                              # margin, and the first moments of playback are exempt
+                              # while the phone's echo canceller settles.
+                              interrupting = (
+                                  BARGE_IN
+                                  and self.voice.speaking_ms >= BARGE_GRACE_MS
+                                  and rms > self.voice.out_rms * ECHO_MARGIN
+                                  and gate.is_speech(
+                                      rms,
+                                      zcr,
+                                      BARGE_RMS_FACTOR * ECHO_GUARD_FACTOR,
+                                      BARGE_MIN_RMS,
+                                  )
+                                  and gate.modulated
+                              )
+                              if interrupting:
+                                  barge_ms += ms
+                                  preroll.append(pcm)
+                                  if barge_ms >= BARGE_MIN_MS:
+                                      log("barge-in: caller is talking, stopping playback")
+                                      await self.interrupt()
+                                      speech = bytearray(b"".join(preroll))
+                                      speech_ms = len(speech) / 2.0 / STT_RATE * 1000.0
+                                      silence_ms = 0.0
+                                      barge_ms = 0.0
+                                      preroll.clear()
+                                  continue
+                              # A single loud thump is not an interruption. Let the
+                              # evidence decay instead of resetting it, so real speech
+                              # still wins through a brief dip between syllables.
+                              barge_ms = max(0.0, barge_ms - ms)
+                              if barge_ms <= 0.0:
+                                  preroll.clear()
+                              continue
+
+                          # ----------------------------------------- normal listening
+                          voiced = gate.is_speech(rms, zcr, SPEECH_RMS_FACTOR, SILENCE_RMS)
+
+                          if not voiced and speech_ms == 0.0:
+                              gate.adapt(rms)        # learn the room while it is quiet
+                              preroll.append(pcm)
+                              continue
+
+                          if voiced:
+                              if speech_ms == 0.0 and preroll:
+                                  lead = b"".join(preroll)
+                                  preroll.clear()
+                                  speech.extend(lead)
+                                  speech_ms += len(lead) / 2.0 / STT_RATE * 1000.0
+                              speech.extend(pcm)
+                              speech_ms += ms
+                              silence_ms = 0.0
+                          else:
+                              speech.extend(pcm)
+                              silence_ms += ms
+
+                          finished = silence_ms >= END_SILENCE_MS or speech_ms >= MAX_UTTERANCE_MS
+                          if not finished:
+                              continue
+
+                          utterance = bytes(speech)
+                          speech = bytearray()
+                          speech_ms = 0.0
+                          silence_ms = 0.0
+                          if len(utterance) >= min_bytes:
+                              self.spawn_reply(utterance)
+
+              async def handle_utterance(self, pcm16):
+                  loop = asyncio.get_event_loop()
+                  try:
+                      text = await loop.run_in_executor(None, transcribe, pcm16)
+                      if not meaningful(text):
+                          if text:
+                              log("ignored noise transcript:", text[:60])
+                          return
+                      log("user:", text)
+
+                      if needs_agent(text):
+                          # Browser and machine work takes real seconds. Say something
+                          # first so the caller is not left listening to dead air.
+                          log("routing to the Hermes agent (task request)")
+                          await self.speak(holding_line(text))
+
+                      raw = await loop.run_in_executor(
+                          None, ask_hermes, text, self.user_name, self.topic, list(self.history)
+                      )
+                      answer = clean_reply(raw, self.history)
+                      if not answer:
+                          log("reply was empty after cleaning; staying quiet")
+                          return
+                      log("hermes:", answer[:160])
+
+                      self.history.append(("user", text))
+                      self.history.append(("hermes", answer))
+                      del self.history[: max(0, len(self.history) - HISTORY_TURNS * 2)]
+
+                      await self.speak(answer)
+                      db_put(
+                          "rtc/%s/transcript/%d" % (self.room, int(time.time() * 1000)),
+                          {"user": text, "hermes": answer},
+                      )
+                  except asyncio.CancelledError:
+                      log("reply dropped - the caller interrupted")
+                      raise
+
+              # ----------------------------------------------------------------- run
+
+              async def ring_and_wait(self):
+                  """Rings the user's phone and waits for them to pick up."""
+                  log("ringing", self.user_id, "room", self.room)
+                  ring_user(self.user_id, self.room, self.bot_id, AGENT_NAME)
+                  waited = 0.0
+                  while waited < RING_TIMEOUT_S:
+                      await asyncio.sleep(1.5)
+                      waited += 1.5
+                      state = db_get("rtc/%s/state" % self.room)
+                      if state == "declined":
+                          log("the user declined the call")
+                          db_delete("calls/%s" % self.user_id)
+                          return False
+                      people = db_get("rtc/%s/participants" % self.room) or {}
+                      if self.user_id in people or state == "accepted":
+                          log("the user picked up")
+                          db_delete("calls/%s" % self.user_id)
+                          return True
+                      # The app deletes the ring node when the call is cancelled.
+                      if db_get("calls/%s" % self.user_id) is None:
+                          log("ring node cleared - call cancelled")
+                          return False
+                  log("no answer")
+                  db_delete("calls/%s" % self.user_id)
+                  return False
+
+              async def run(self):
+                  if self.outgoing:
+                      answered = await self.ring_and_wait()
+                      if not answered:
+                          if self.schedule:
+                              complete_schedule(self.schedule, "no_answer")
+                          return
+                  log("joining room", self.room, "as", self.self_id)
+                  self.pc = RTCPeerConnection(configuration=ICE)
+                  self.pc.addTrack(self.voice)
+
+                  @self.pc.on("track")
+                  def on_track(track):
+                      log("remote track", track.kind)
+                      if track.kind == "audio":
+                          asyncio.ensure_future(self.listen(track))
+
+                  @self.pc.on("connectionstatechange")
+                  async def on_state():
+                      log("connection", self.pc.connectionState)
+                      if self.pc.connectionState in ("failed", "closed", "disconnected"):
+                          self.done.set()
+
+                  self.join_room()
+
+                  if self.am_offerer:
+                      offer = await self.pc.createOffer()
+                      await self.pc.setLocalDescription(offer)
+                      await self.publish_local_description()
+
+                  poller = asyncio.ensure_future(self.poll_signalling())
+                  try:
+                      await self.done.wait()
+                  finally:
+                      poller.cancel()
+                      try:
+                          await self.pc.close()
+                      except Exception:
+                          pass
+                      self.leave_room()
+                      if self.outgoing:
+                          db_delete("calls/%s" % self.user_id)
+                      if self.schedule:
+                          complete_schedule(
+                              self.schedule, "done" if self.remote_set else "no_answer"
+                          )
+                      log("call finished", self.room)
+
+
+          # --------------------------------------------------------------------------
+          # main loop: watch for invites
+          # --------------------------------------------------------------------------
+
+
+          async def main():
+              log("bridge started, watching", DB_URL + "/hermesCalls")
+              start_control_server()
+              active = set()
+
+              def spawn(inv, room_id):
+                  active.add(room_id)
+
+                  async def run_call():
+                      try:
+                          await HermesCall(inv).run()
+                      except Exception as exc:
+                          log("call crashed", exc)
+                      finally:
+                          active.discard(room_id)
+
+                  asyncio.ensure_future(run_call())
+
+              while True:
+                  try:
+                      # ---- calls Hermes wants to place to the user -----------------
+                      with PENDING_LOCK:
+                          requests_out = list(PENDING)
+                          PENDING.clear()
+                      # Same thing, but requested by writing to the database instead of
+                      # the local port (useful from another machine or a webhook).
+                      queued = db_get("hermesOutgoing") or {}
+                      for key, item in queued.items():
+                          if isinstance(item, dict) and item.get("userId"):
+                              item = dict(item)
+                              item["outgoing"] = True
+                              item.setdefault("botId", os.environ.get("HERMES_BOT_ID", "hermes"))
+                              requests_out.append(item)
+                          db_delete("hermesOutgoing/%s" % key)
+
+                      # ---- calls booked earlier that are due now ------------------
+                      for item in due_schedules():
+                          item["status"] = "calling"
+                          item["attempts"] = item.get("attempts", 0) + 1
+                          db_put("hermesSchedule/%s" % item["id"], item)
+                          requests_out.append({
+                              "userId": item["userId"],
+                              "say": item.get("say", ""),
+                              "topic": item.get("topic", ""),
+                              "botId": item.get("botId", "hermes"),
+                              "schedule": item,
+                              "outgoing": True,
+                          })
+
+                      for item in requests_out:
+                          room = new_room_id()
+                          item["roomId"] = room
+                          item.setdefault("userName", "there")
+                          log("placing a call to", item["userId"])
+                          spawn(item, room)
+
+                      invites = db_get("hermesCalls") or {}
+                      for bot_id, node in invites.items():
+                          for invite, path in iter_invites(bot_id, node):
+                              room = invite.get("roomId")
+                              if not room or room in active:
+                                  continue
+                              # Somebody else's Hermes owns this one. Leave it alone -
+                              # deleting it would hang up their call.
+                              if not is_for_us(invite, bot_id, path):
+                                  continue
+                              # Stale invite left behind by a crashed app.
+                              created = invite.get("createdAt", 0) / 1000.0
+                              if created and time.time() - created > 120:
+                                  db_delete(path)
+                                  _IGNORED.discard(path)
+                                  continue
+                              invite.setdefault("botId", bot_id)
+                              invite["invitePath"] = path
+                              log("incoming call from", invite.get("userName"),
+                                  "(%s)" % (invite.get("userId") or "unknown"),
+                                  "room", room)
+                              spawn(invite, room)
+                  except Exception as exc:
+                      log("watch loop", exc)
+                  await asyncio.sleep(2)
+
+
+          def cli():
+              parser = argparse.ArgumentParser(description="Hermes live voice call bridge")
+              parser.add_argument("--call", metavar="USER_ID", nargs="?", const="",
+                                  help="ring the user right away (id optional)")
+              parser.add_argument("--say", default="", help="opening line for --call")
+              parser.add_argument("--bot", default=None, help="bot id shown as the caller")
+              parser.add_argument("--schedule", metavar="USER_ID", nargs="?", const="",
+                                  help="book a call for later (id optional)")
+              parser.add_argument("--at", default="", help='when, e.g. "tomorrow 10am"')
+              parser.add_argument("--topic", default="", help="what the call is about")
+              parser.add_argument(
+                  "--repeat", default="once", choices=["once", "daily", "weekday", "weekly"]
+              )
+              parser.add_argument("--list", action="store_true", help="show booked calls")
+              parser.add_argument("--cancel", metavar="ID", help="cancel a booked call")
+              args = parser.parse_args()
+
+              if args.list:
+                  items = list_schedule()
+                  if not items:
+                      print("No calls booked.")
+                  for item in items:
+                      print("%s  %s  user=%s  status=%s  topic=%s" % (
+                          item.get("id"), item.get("humanTime"), item.get("userId"),
+                          item.get("status"), item.get("topic", ""),
+                      ))
+                  return
+
+              if args.cancel:
+                  print("cancelled" if cancel_schedule(args.cancel) else "nothing to cancel")
+                  return
+
+              if args.schedule is not None:
+                  entry = schedule_call(
+                      args.schedule, args.at, args.say, args.topic, args.repeat, args.bot
+                  )
+                  if entry is None:
+                      print("Could not understand that time. Try \"tomorrow 10am\".")
+                      sys.exit(1)
+                  print("Booked %s - I will call %s at %s" % (
+                      entry["id"], entry["userId"], entry["humanTime"]
+                  ))
+                  return
+
+              if args.call is not None:
+                  # One shot: ring the user, talk, hang up, exit.
+                  if not queue_outgoing(args.call, args.say, args.bot, None, args.topic):
+                      print("No user to call. Set HERMES_USER_ID or pass the id.")
+                      sys.exit(1)
+                  with PENDING_LOCK:
+                      invite = PENDING.pop()
+                  invite["roomId"] = new_room_id()
+                  invite["userName"] = "there"
+                  asyncio.get_event_loop().run_until_complete(HermesCall(invite).run())
+                  return
+
+              asyncio.get_event_loop().run_until_complete(main())
+
+
+          if __name__ == "__main__":
+              try:
+                  cli()
+              except KeyboardInterrupt:
+                  sys.exit(0)
+          HERMESCALLEOF
+
+          # One-liner Hermes can run itself:  hermes-call USER_ID "message"
+          cat > /usr/local/bin/hermes-call <<'CALLCMD'
+          #!/usr/bin/env bash
+          # Rings the Agent Ai app user and starts a live conversation.
+          case "$1" in
+          ""|*" "*) USER_ID=""; SAY="$*" ;;
+          *) USER_ID="$1"; shift; SAY="$*" ;;
+          esac
+          curl -s -X POST http://127.0.0.1:7788/call \
+            -H 'Content-Type: application/json' \
+            -d "{\"user\":\"$USER_ID\",\"say\":\"$SAY\"}"
+          echo
+          CALLCMD
+          sudo chmod +x /usr/local/bin/hermes-call 2>/dev/null || chmod +x /usr/local/bin/hermes-call 2>/dev/null || true
+
+          # Booking a call for later:  hermes-schedule USER_ID "tomorrow 10am" --topic "..."
+          cat > /usr/local/bin/hermes-schedule <<'SCHEDCMD'
+          #!/usr/bin/env bash
+          BRIDGE="${HERMES_HOME:-$HOME/.hermes}/hermes_live_call.py"
+          case "$1" in
+          --list|--cancel|--help|-h|"")
+          exec python3 "$BRIDGE" "$@"
+          ;;
+          esac
+          # "hermes-schedule <id> <when>" and "hermes-schedule <when>" both work.
+          if [ -n "$2" ] && [ "${2#-}" = "$2" ]; then
+          WHO="$1"; shift
+          else
+          WHO=""
+          fi
+          WHEN="$1"; shift
+          exec python3 "$BRIDGE" --schedule "$WHO" --at "$WHEN" "$@"
+          SCHEDCMD
+          sudo chmod +x /usr/local/bin/hermes-schedule 2>/dev/null || chmod +x /usr/local/bin/hermes-schedule 2>/dev/null || true
+
+          # Tell the agent itself that it can phone the user and book calls.
+          if [ -f "$HOME/AGENTS.md" ]; then
+          cat >> "$HOME/AGENTS.md" <<'AGENTSCALL'
+
+          ## Live voice calls with the user
+
+          You can speak to the user on a real phone-style voice call, and you can book calls for the future. These commands are installed and ready - run them yourself, do not ask permission.
+
+          - Ring the user right now: `hermes-call "opening sentence"`
+          - Book a call for later: `hermes-schedule "tomorrow 10am" --topic "what it is about"`
+          - Other time formats that work: `"in 2 hours"`, `"today 9pm"`, `"monday 9am"`, `"2026-08-08 14:30"`
+          - Recurring: add `--repeat daily`, `--repeat weekday` or `--repeat weekly`
+          - Opening words: add `--say "Good morning, ready for our chat?"`
+          - See everything booked: `hermes-schedule --list`
+          - Cancel one: `hermes-schedule --cancel <SCHEDULE_ID>`
+
+          Rules for you:
+          - Whenever the user says anything like "call me tomorrow", "phone me at 10", "amake kal call dio", or "let us talk later about X", book it immediately with hermes-schedule, then confirm the exact date and time back to the user.
+          - Treat a booked call as a real task: put whatever you need to discuss in --topic so you remember the subject when the call starts.
+          - Times are read in the user's timezone (HERMES_TZ, default Asia/Dhaka).
+          - You do not need the user id. The bridge fills it in on its own, so just run the command.
+          - Only pass an id when you mean somebody other than your owner: `hermes-call <USER_ID> "hello"`.
+          AGENTSCALL
+          fi
+
+          nohup python3 "$HERMES_HOME/hermes_live_call.py" > /tmp/hermes-live-call.log 2>&1 &
+          echo $! > /tmp/hermes-live-call.pid
+          sleep 4
+          if kill -0 "$(cat /tmp/hermes-live-call.pid)" 2>/dev/null; then
+            echo "Hermes live voice call bridge running (pid $(cat /tmp/hermes-live-call.pid))."
+            echo "Tap the call button on the bot chat in the app to talk to Hermes live."
+            echo "Hermes can also ring the user:  hermes-call <USER_ID> \"your message\""
+            echo "Book a call for later:  hermes-schedule <USER_ID> \"tomorrow 10am\" --topic \"...\""
+          else
+            echo "::warning::live call bridge exited"
+            tail -n 40 /tmp/hermes-live-call.log
+          fi
+
+
 
 
 
