@@ -200,15 +200,34 @@ def dm_peer_of(gid: str, owner: str):
     return None
 
 
+def msg_ts(m) -> int:
+    """Message timestamp as int; tolerates str/float/None junk values."""
+    try:
+        return int(float(m.get("timestamp") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def is_bot_dm(gid: str, bid: str) -> bool:
+    """True when the DM thread is a direct private chat WITH the bot itself."""
+    if not gid.startswith("dm_"):
+        return False
+    return bid in [x for x in gid[3:].split("_") if x]
+
+
 def touch_dm_index(db: str, gid: str, owner: str) -> None:
     """Bumps both sides of the DM index after the bot posts in a DM."""
     peer = dm_peer_of(gid, owner)
+    a = owner
+    if not peer:
+        a = bot_member_id(owner)
+        peer = dm_peer_of(gid, a)
     if not peer:
         return
     now = int(time.time() * 1000)
     try:
         http("%s/group/dmIndex.json" % db,
-             {"%s/%s" % (owner, peer): now, "%s/%s" % (peer, owner): now},
+             {"%s/%s" % (a, peer): now, "%s/%s" % (peer, a): now},
              method="PATCH")
     except Exception as e:
         log("dm index update failed: %s" % e)
@@ -338,7 +357,8 @@ def is_task(m: dict) -> bool:
 
 
 def should_reply(m: dict, owner: str, bid: str, bname: str,
-                 settings: dict, my_ids, recent) -> bool:
+                 settings: dict, my_ids, recent,
+                 bot_dm: bool = False) -> bool:
     sender = m.get("senderId") or ""
     if sender == bid:
         return False
@@ -356,6 +376,13 @@ def should_reply(m: dict, owner: str, bid: str, bname: str,
             log("bot-to-bot loop guard triggered - staying quiet")
             return False
         return True
+    if bot_dm:
+        # a private 1-to-1 chat WITH the bot itself: no mention or /task
+        # needed - a plain "hi" must always get an answer. The owner is
+        # always answered; other users only when the owner allowed it.
+        if sender == owner:
+            return True
+        return bool(settings.get("botReplyOthers"))
     if sender == owner:
         # the owner: mention, reply-to-bot or /task triggers a response
         return mentioned or task
@@ -385,8 +412,18 @@ def build_prompt(m: dict, gid: str, gname: str, group: dict, users: dict,
     sender_id = m.get("senderId") or "?"
     mtype = (m.get("type") or "text").lower()
 
+    bid = bot_member_id(owner)
     dm_peer = dm_peer_of(gid, owner)
-    if dm_peer:
+    if dm_peer is None and is_bot_dm(gid, bid):
+        dm_peer = dm_peer_of(gid, bid)
+    if dm_peer == bid:
+        lines = ["[Hermesa PRIVATE DM] You are \"%s\", the personal bot of "
+                 "owner %s, inside a PRIVATE one-to-one chat with your OWNER. "
+                 "Nobody else can read this thread. Answer EVERY message "
+                 "directly and naturally, like a personal assistant - even a "
+                 "simple greeting deserves a friendly reply."
+                 % (bname, owner)]
+    elif dm_peer:
         lines = ["[Hermesa PRIVATE DM] You are \"%s\", the bot of owner %s, "
                  "inside a PRIVATE one-to-one chat between your owner and "
                  "\"%s\" (user id %s). Nobody else can read this thread."
@@ -558,6 +595,10 @@ def main() -> None:
             users = None
             convos = dict(groups)
             dm_threads = fetch_dm_threads(db, owner)
+            # also watch DM threads that users opened DIRECTLY with the bot
+            # (those live in the bot's own dmIndex, not the owner's)
+            for dmid, peer in fetch_dm_threads(db, bid).items():
+                dm_threads.setdefault(dmid, peer)
             if dm_threads:
                 users = fetch_users(db)
                 for dmid, peer in dm_threads.items():
@@ -571,7 +612,7 @@ def main() -> None:
                 gst = group_state(st, gid)
                 msgs = fetch_messages(db, gid)
                 new = [m for m in msgs
-                       if int(m.get("timestamp") or 0) > gst["last_ts"]
+                       if msg_ts(m) > gst["last_ts"]
                        and m.get("id") not in st["done_ids"]
                        and (m.get("senderId") or "") != bid]
                 if not new:
@@ -581,12 +622,13 @@ def main() -> None:
                 mark_seen(db, gid, owner, [m["id"] for m in new])
                 for m in new:
                     st["done_ids"].append(m["id"])
-                    ts = int(m.get("timestamp") or 0)
+                    ts = msg_ts(m)
                     if ts > gst["last_ts"]:
                         gst["last_ts"] = ts
                     save_state(st)
                     if should_reply(m, owner, bid, bname, settings,
-                                    st["my_ids"], msgs):
+                                    st["my_ids"], msgs,
+                                    bot_dm=is_bot_dm(gid, bid)):
                         process_message(db, gid, gname, group, owner, bname,
                                         m, users, msgs, st)
                         save_state(st)

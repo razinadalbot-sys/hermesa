@@ -123,6 +123,14 @@ def http_json(url: str, payload=None, timeout=30):
         return json.loads(r.read().decode("utf-8", "replace") or "null")
 
 
+def msg_ts(m) -> int:
+    """Message timestamp as int; tolerates str/float/None junk values."""
+    try:
+        return int(float(m.get("timestamp") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def fetch_recent_messages(db_url: str, bot_id: str):
     # push keys sort chronologically, and orderBy="$key" needs no .indexOn
     url = ('%s/bots/%s/messages.json?orderBy="$key"&limitToLast=40'
@@ -135,7 +143,7 @@ def fetch_recent_messages(db_url: str, bot_id: str):
         if isinstance(m, dict):
             m.setdefault("id", key)
             out.append(m)
-    out.sort(key=lambda m: (m.get("timestamp") or 0, m.get("id") or ""))
+    out.sort(key=lambda m: (msg_ts(m), str(m.get("id") or "")))
     return out
 
 
@@ -448,7 +456,7 @@ def main() -> None:
         for m in msgs:
             if (m.get("sender") or "bot") != "user":
                 continue
-            ts = int(m.get("timestamp") or 0)
+            ts = msg_ts(m)
             mid = str(m.get("id") or "")
             if ts <= 0 or not mid:
                 continue
