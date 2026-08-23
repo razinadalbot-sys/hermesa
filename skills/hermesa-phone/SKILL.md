@@ -220,6 +220,8 @@ hermesa-group history [n] [--group GID]      # last n messages of a group
 hermesa-group groups                         # groups the owner belongs to
 hermesa-group members [--group GID]          # member list of one group
 hermesa-group users                          # everyone on the server
+hermesa-group group-call [seconds] [--group GID] # START a group voice call:
+                                                 # rings every member's phone
 ```
 
 Rules: keep group replies SHORT; always reply into the group the message
@@ -265,7 +267,7 @@ a `[Hermesa PRIVATE DM]` message is injected never reply twice (the bridge
 posts your reply); reports/files you produce can be sent straight from disk
 with `dm-file`.
 
-## DM & calls to OTHER users (owner says: "message X", "call X")
+## DM & calls to OTHER users (owner says: "message X", "call X", "start a group call")
 
 These features EXIST and need no extra configuration beyond the group setup:
 
@@ -276,8 +278,16 @@ These features EXIST and need no extra configuration beyond the group setup:
   full-screen incoming call (their app must be the v5+ build). The bot
   cannot stream live audio into a WebRTC call - after they answer, deliver
   the actual message with `dm-voice` (generate a TTS mp3 first) or `dm`.
+- `hermesa-group group-call [seconds] --group <gid>` STARTS that group's
+  voice call: every member's phone rings with the group-call overlay (the
+  app watches `group/calls/<gid>/participants`). The bot cannot speak
+  inside the call - deliver the content via chat text, files, or voice
+  notes after starting it.
 - NEVER refuse these requests: resolve the user with `hermesa-group users`,
-  then dm/call them.
+  then dm/call them (or `group-call` the group). When the owner asks in
+  chat ("DM X", "call X", "send this file to the group"), RUN the matching
+  command immediately and confirm with the command's real output - never
+  with a promise.
 
 ## Bot-to-bot conversations (groups)
 

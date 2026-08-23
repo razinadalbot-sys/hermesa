@@ -15,6 +15,8 @@ Environment:
 Usage:
   hermesa-group text "message" [--group GID] [--reply-to MSG_ID]
   hermesa-group task "task description" [--group GID]
+  hermesa-group group-call [seconds] [--group GID]  # START a group voice call:
+                                                    # rings every member's phone
   hermesa-group file <path> [caption] [--group GID]
   hermesa-group image <path> [caption] [--group GID]
   hermesa-group pin <messageId> [off] [--group GID]
@@ -390,6 +392,48 @@ def cmd_call(peer, user, seconds):
         print("no answer after %ds - ring cancelled, missed-call note sent in the DM." % seconds)
 
 
+def cmd_group_call(gid, seconds):
+    """Starts/announces the GROUP voice call: the app watches
+    group/calls/<gid>/participants, so joining the bot there makes every
+    member's phone ring with the group-call overlay (CallWatcherService).
+    The bot has NO live WebRTC audio - after people join, deliver the
+    actual content via chat text, files, or voice notes.
+    """
+    owner = owner_id()
+    me = "bot:%s" % owner
+    path = "group/calls/%s/participants/%s" % (gid, me)
+    http("PUT", "%s/%s.json" % (db_url(), path), {
+        "id": me,
+        "name": bot_name(),
+        "joinedAt": {".sv": "timestamp"},
+        "muted": True,
+    })
+    send_text(gid, "📞 %s started a group voice call - tap the call "
+                   "button to join!" % bot_name())
+    print("group call started in %s - ringing members for up to %ds ..."
+          % (gid, seconds))
+    joined = False
+    waited = 0
+    while waited < seconds:
+        time.sleep(3)
+        waited += 3
+        parts = get("group/calls/%s/participants" % gid) or {}
+        if any(k != me for k in parts):
+            joined = True
+            break
+    # leave either way: the bot cannot stream audio, and staying would be
+    # a silent ghost member; once humans joined the call continues alone.
+    http("DELETE", "%s/%s.json" % (db_url(), path))
+    if joined:
+        print("ok: someone joined the group call. NOTE: the bot has no "
+              "live microphone - keep talking via chat texts, files or "
+              "voice notes.")
+    else:
+        send_text(gid, "📞 Missed group call from %s" % bot_name())
+        print("no answer after %ds - call cancelled, missed-call note "
+              "posted to the group." % seconds)
+
+
 def send_voice(gid, path, caption):
     """Sends an audio file as a playable in-chat voice note (TTS 'voice call')."""
     if not os.path.isfile(path):
@@ -502,6 +546,9 @@ def main():
         peer, u = resolve_peer(rest[0])
         seconds = int(rest[1]) if len(rest) > 1 else 45
         cmd_call(peer, u, min(max(seconds, 10), 55))
+    elif cmd in ("group-call", "groupcall", "call-group"):
+        seconds = int(rest[0]) if rest else 45
+        cmd_group_call(gid, min(max(seconds, 10), 55))
     elif cmd in ("dm-file", "dm-image"):
         if len(rest) < 2:
             print("ERROR: %s requires <userIdOrName> and <path>" % cmd, file=sys.stderr)

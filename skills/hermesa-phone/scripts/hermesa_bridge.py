@@ -387,9 +387,13 @@ def inject_into_agent(message: str) -> tuple:
                     % cmd[:1])
                 continue
             except subprocess.TimeoutExpired:
-                return (False, "⏳ The agent is still working on this - it took "
-                               "longer than the bridge wait limit. It will push "
-                               "the result to this chat when done.")
+                # the subprocess was KILLED - nothing keeps running, so be
+                # honest and queue the task for the drain pass instead of
+                # promising a result that will never arrive.
+                queue_fallback(message)
+                return (False, "⏳ This took longer than my wait limit, so I "
+                               "queued it - I will finish it and post the "
+                               "result on my next pass.")
             if res.returncode == 0:
                 reply = extract_reply(res.stdout)
                 if reply:
@@ -413,6 +417,100 @@ def queue_fallback(message: str) -> None:
     os.makedirs(INBOX, exist_ok=True)
     with open(QUEUE_FILE, "a") as fh:
         fh.write("\n## %s\n%s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), message))
+
+
+# ----------------------------------------------------------------------
+# task completion enforcement
+# ----------------------------------------------------------------------
+# The agent runs ONE-SHOT per message: when its reply comes back, the
+# process is gone. So a reply like "On it - I'll get back to you" means
+# the task silently DIES. These helpers detect acknowledgment-only
+# replies and immediately re-inject a "finish it NOW" follow-up turn.
+_ACK_RE = re.compile(
+    r"(on it|i'?ll (get|start|work|do|look|check|handle)|"
+    r"working on (it|this|that)|i('?m| am) (on|starting|working)|"
+    r"give me (a (moment|minute|min|sec|second)|some time)|"
+    r"hold on|hang tight|stay tuned|right away|coming (right )?up|"
+    r"will (do|start|update|get back|handle|deliver)|"
+    r"let me (get|start|work|check|look)|starting (now|on|the)|"
+    r"kore dicchi|kore dibo|korchi|kortesi|kaj shuru|dekhchi|dekhtesi|"
+    r"ektu (wait|opekkha)|shortly|in a (bit|moment|minute))",
+    re.IGNORECASE)
+# things that look like an actual work product, not a promise
+_DELIVERABLE_RE = re.compile(
+    r"(```|\n[-*•] |\n\d+\. |https?://|\n\|.*\||(^|\n)#{1,3} |\.md\b|"
+    r"saved (at|to|in)|~/\.hermes/)", re.IGNORECASE)
+FORCE_ROUNDS = 2
+
+
+def looks_like_ack_only(reply: str) -> bool:
+    """True when the reply is just a promise with no work product in it."""
+    r = (reply or "").strip()
+    if not r or len(r) > 700:
+        return False
+    if _DELIVERABLE_RE.search(r):
+        return False
+    return bool(_ACK_RE.search(r))
+
+
+def force_completion(prompt: str, reply: str, task_hint: str = "") -> str:
+    """Re-inject up to FORCE_ROUNDS times until the reply stops being an
+    acknowledgment and contains the actual deliverable."""
+    for i in range(FORCE_ROUNDS):
+        if not looks_like_ack_only(reply):
+            return reply
+        log("reply is acknowledgment-only - forcing completion "
+            "(round %d/%d)" % (i + 1, FORCE_ROUNDS))
+        followup = (
+            "[Hermesa bridge follow-up] Your previous reply was: %r\n"
+            "That was ONLY an acknowledgment. REALITY CHECK: you are a "
+            "one-shot process - nothing runs after you reply, there is no "
+            "background worker, so anything you 'promise' will NEVER "
+            "happen.\n"
+            "DO THE WORK RIGHT NOW using your skills, scripts and "
+            "terminal, then reply with the COMPLETE professional "
+            "deliverable (the actual content/result/file path - not a "
+            "status update, not a plan, not a promise).\n\n"
+            "The original request was:\n%s"
+            % (reply[:400], (task_hint or prompt)[-6000:]))
+        ok, second = inject_into_agent(followup)
+        if not ok or not second:
+            break
+        reply = second
+    return reply
+
+
+_DRAIN = {"last": 0.0}
+
+
+def drain_queue(post_fn, extra: str = "") -> None:
+    """Process messages queued while the agent was unreachable, so queued
+    tasks actually get DONE instead of rotting in queue.md forever."""
+    try:
+        with open(QUEUE_FILE) as fh:
+            queued = fh.read().strip()
+    except OSError:
+        return
+    if not queued:
+        return
+    if time.time() - _DRAIN["last"] < 120:  # don't hammer a dead gateway
+        return
+    _DRAIN["last"] = time.time()
+    log("draining queued messages (%d bytes)" % len(queued))
+    prompt = ("[Hermesa queued messages] The following messages arrived "
+              "while you were unreachable. Handle them NOW - do every "
+              "task fully and include the results. %s\n\n%s"
+              % (extra, queued[-12000:]))
+    ok, reply = inject_into_agent(prompt)
+    if not ok or not reply:
+        return
+    reply = force_completion(prompt, reply)
+    try:
+        os.remove(QUEUE_FILE)
+    except OSError:
+        pass
+    if post_fn:
+        post_fn(reply)
 
 
 # ----------------------------------------------------------------------
@@ -462,7 +560,21 @@ def build_agent_message(msg: dict) -> str:
               "workspace with FULL access to your skills, memory/brain "
               "files, scripts and tools - read and use them exactly like "
               "any other task. For sending images/files/calls to the phone "
-              "use the `hermesa` command.]")
+              "use the `hermesa` command (text/image/file/call). SMART "
+              "ACTIONS: when the boss asks to DM a user, call/ring a user, "
+              "start a group call, or send a file to a group or a person, "
+              "EXECUTE the `hermesa-group` CLI in your terminal NOW - never "
+              "say you can't: `hermesa-group dm <userIdOrName> \"text\"`, "
+              "`dm-file`/`dm-image`/`dm-voice <user> <path>`, "
+              "`call <user>` (rings their phone), `group-call --group "
+              "<gid>` (rings every member), `file`/`image <path> --group "
+              "<gid>`. Resolve names with `hermesa-group users` and pick "
+              "group ids from `hermesa-group groups`. CRITICAL: you are a ONE-SHOT "
+              "process - NOTHING runs after you reply and there is no "
+              "background worker, so never answer a task with only an "
+              "acknowledgment or a promise ('on it', 'I will do it'). DO "
+              "the work NOW with your skills/tools and make your reply "
+              "the finished result itself.]")
 
     if mtype in ("voice", "audio") or (msg.get("audioUrl") and mtype != "voice_call"):
         fname = safe_name(msg.get("audioFileName") or "voice_note.m4a",
@@ -538,6 +650,9 @@ def process_message(db_url: str, bot_id: str, msg: dict) -> None:
     beat.start()
     try:
         ok, reply = inject_into_agent(agent_msg)
+        if ok and reply:
+            # never let an "on it..." acknowledgment be the final word
+            reply = force_completion(agent_msg, reply)
     finally:
         stop_typing.set()
         try:
@@ -581,6 +696,8 @@ def main() -> None:
         if (db_url, bot_id) != persisted_cfg:
             persist_env({"HERMESA_DB_URL": db_url, "HERMESA_BOT_ID": bot_id})
             persisted_cfg = (db_url, bot_id)
+        # finish anything that was queued while the agent was unreachable
+        drain_queue(lambda text: post_bot_message(db_url, bot_id, text))
         try:
             msgs = fetch_recent_messages(db_url, bot_id)
         except Exception as e:

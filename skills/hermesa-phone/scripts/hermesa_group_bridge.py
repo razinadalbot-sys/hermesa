@@ -503,35 +503,129 @@ def build_prompt(m: dict, gid: str, gname: str, group: dict, users: dict,
     if dm_peer:
         cli_hint = ("IMPORTANT: your final answer text is delivered into THIS "
                     "private chat automatically as your reply - do NOT also send "
-                    "it with `hermesa-group dm` and do NOT narrate or confirm "
-                    "what you did. Use the CLI ONLY for attachments: files "
-                    "(`dm-file %s <path> [caption]`), photos (`dm-image`), or a "
-                    "playable voice note such as generated TTS audio "
-                    "(`dm-voice %s <audioPath>`)." % (dm_peer, dm_peer))
+                    "it with `hermesa-group dm` and do NOT narrate what you did. "
+                    "ACTION REQUESTS: when asked to send/DM/call/share, EXECUTE "
+                    "the matching `hermesa-group` command in your terminal NOW - "
+                    "never say you can't. Available: send a file here "
+                    "(`dm-file %s <path> [caption]`), a photo (`dm-image`), a "
+                    "playable voice note e.g. generated TTS (`dm-voice %s "
+                    "<audioPath>`), DM ANY other user (`dm <userIdOrName> "
+                    "\"text\"`), RING a user's phone with a real call "
+                    "(`call <userIdOrName>`), or START a group voice call "
+                    "(`group-call --group <gid>`). Resolve display names "
+                    "first with `hermesa-group users`." % (dm_peer, dm_peer))
     else:
         cli_hint = ("IMPORTANT: your final answer text is posted to THIS group "
                     "automatically as your reply - do NOT also send it with the "
-                    "CLI and do NOT narrate or confirm what you did. Use the "
-                    "`hermesa-group` CLI (--group %s) ONLY for extras: sending "
-                    "files/images, pins, history, or PRIVATE messages "
-                    "(`hermesa-group dm <userIdOrName> \"text\"`, also dm-file/"
-                    "dm-image/dm-voice)." % gid)
+                    "CLI and do NOT narrate what you did. ACTION REQUESTS: when "
+                    "asked to send/DM/call/share/pin, EXECUTE the matching "
+                    "`hermesa-group` command in your terminal NOW - never say "
+                    "you can't. Available: send a file to this group "
+                    "(`file <path> [caption] --group %s`), an image "
+                    "(`image <path> [caption] --group %s`), START a GROUP VOICE "
+                    "CALL that rings every member's phone (`group-call --group "
+                    "%s`), DM a user privately (`dm <userIdOrName> \"text\"`, "
+                    "also dm-file/dm-image/dm-voice), RING one user's phone "
+                    "(`call <userIdOrName>`), or pin a message (`pin <msgId> "
+                    "--group %s`). Resolve display names first with "
+                    "`hermesa-group users`." % (gid, gid, gid, gid))
     if is_task(m):
         lines.append("New GROUP TASK from %s (%s): %s" % (sender_name, sender_id, body))
-        lines.append("Do the task if it is quick, or start it and say what "
-                     "you'll deliver. %s" % cli_hint)
+        lines.append("COMPLETE this task NOW, in THIS run. You are a "
+                     "one-shot process: nothing you promise will ever run "
+                     "later, so 'on it' / 'I'll do it' means the task "
+                     "silently dies. Use your skills, scripts and terminal "
+                     "to actually do the work, and make your reply the "
+                     "finished, professional deliverable itself (the real "
+                     "content, result or file - never a status update, a "
+                     "plan, or a promise). %s" % cli_hint)
     else:
         lines.append("New message from %s (%s)%s: %s" % (
             sender_name, sender_id,
             " [another user's bot]" if m.get("senderIsBot") else "", body))
-        lines.append("Write a helpful, SHORT group-chat reply (plain text). "
+        lines.append("Write a helpful group-chat reply (plain text). If the "
+                     "message asks you to DO something, treat it as a task: "
+                     "do the work NOW and put the actual result in this "
+                     "reply - never reply with only an acknowledgment. "
                      "%s" % cli_hint)
+    if dm_peer:
+        fd_cmd = "`hermesa-group dm-file %s <path> \"caption\"`" % dm_peer
+    else:
+        fd_cmd = "`hermesa-group file <path> \"caption\" --group %s`" % gid
+    lines.append("FILE DELIVERY: your plain-text reply CANNOT carry a file. "
+                 "If ANYONE here - your owner, another user, or another "
+                 "bot - asks for a file/document/report/image/code/audio, "
+                 "CREATE the real file on disk first, then SEND it into "
+                 "this chat with %s BEFORE you finish, and make your text "
+                 "reply a one-line note about what you sent. Saying 'here "
+                 "is the file' or pasting a filename WITHOUT running that "
+                 "command delivers NOTHING to the chat." % fd_cmd)
+    if m.get("senderIsBot"):
+        lines.append("COLLABORATION RULE: this message is from another bot. "
+                     "No small talk, no compliments, no 'let's do it' "
+                     "ping-pong. Every turn must ADD real work: a draft, "
+                     "research findings, code, numbers, or a concrete piece "
+                     "of the deliverable. If the recent conversation "
+                     "already contains enough material, STOP discussing and "
+                     "post the COMPLETE professional final deliverable now, "
+                     "clearly labeled FINAL. If the agreed deliverable is a "
+                     "file, actually SEND it with the hermesa-group file "
+                     "command - describing a file in text is NOT delivering "
+                     "it.")
     return "\n".join(lines)
 
 
+def _msg_priority(m: dict, owner: str) -> int:
+    """Lower = more important: owner tasks > owner messages > other
+    humans' tasks > other humans' messages > other bots."""
+    sender = m.get("senderId") or ""
+    if sender == owner:
+        return 0 if is_task(m) else 1
+    if not m.get("senderIsBot"):
+        return 2 if is_task(m) else 3
+    return 4
+
+
+def process_batch(db: str, gid: str, gname: str, group: dict, owner: str,
+                  bname: str, batch, users: dict, recent, st: dict) -> None:
+    """SMART BURST HANDLING: everything that arrived in one poll cycle is
+    answered in ONE focused agent run with ONE consolidated reply, instead
+    of one full run per message - so a pile-up of replies from several
+    users/bots can never fragment the bot's attention."""
+    batch = sorted(batch, key=lambda x: (_msg_priority(x, owner), msg_ts(x)))
+    primary, others = batch[0], batch[1:]
+    extra = None
+    if others:
+        ex = ["MESSAGE BURST: %d more message(s) arrived at the same time "
+              "as the message above:" % len(others)]
+        for x in others:
+            ex.append("- from %s (%s)%s: %s" % (
+                x.get("senderName") or "?", x.get("senderId") or "?",
+                " [bot]" if x.get("senderIsBot") else "", preview(x)))
+        ex.append("FOCUS RULE: you get exactly ONE reply for this whole "
+                  "burst. The message above is the PRIMARY one (owner "
+                  "tasks outrank owner messages, humans outrank bots) - "
+                  "do ITS work fully and completely FIRST. Then fold "
+                  "short answers to the other messages into the SAME "
+                  "single reply, @mentioning each person you answer. "
+                  "Pure chatter, thanks or compliments that need nothing "
+                  "may be silently ignored. NEVER write one reply per "
+                  "message, and NEVER let the side messages shrink, rush "
+                  "or derail the primary task.")
+        extra = "\n".join(ex)
+    process_message(db, gid, gname, group, owner, bname, primary, users,
+                    recent, st, extra=extra,
+                    mention_ids=list(dict.fromkeys(
+                        x.get("senderId") for x in batch
+                        if x.get("senderId"))))
+
+
 def process_message(db: str, gid: str, gname: str, group: dict, owner: str,
-                    bname: str, m: dict, users: dict, recent, st: dict) -> None:
+                    bname: str, m: dict, users: dict, recent, st: dict,
+                    extra: str = None, mention_ids=None) -> None:
     prompt = build_prompt(m, gid, gname, group, users, recent, owner, bname)
+    if extra:
+        prompt = "%s\n%s" % (prompt, extra)
     log("handling %s message %s from %s in group %s"
         % (m.get("type", "text"), m.get("id"), m.get("senderName"), gid))
     # Live typing indicator: keep group/typing/<gid>/<bot> fresh while the
@@ -562,6 +656,10 @@ def process_message(db: str, gid: str, gname: str, group: dict, owner: str,
         pre_ids = set()
     try:
         ok, reply = hb.inject_into_agent(prompt)
+        if ok and reply:
+            # never let an "on it..." acknowledgment be the final word
+            reply = hb.force_completion(
+                prompt, reply, task_hint=(m.get("text") or ""))
     finally:
         stop_typing.set()
         try:
@@ -594,7 +692,8 @@ def process_message(db: str, gid: str, gname: str, group: dict, owner: str,
         reply_to=m.get("id"),
         reply_to_text=preview(m),
         reply_to_sender=m.get("senderName"),
-        mentions=[m.get("senderId")] if m.get("senderId") else None)
+        mentions=(mention_ids or
+                  ([m.get("senderId")] if m.get("senderId") else None)))
     st["my_ids"].extend(ids)
     if ids:
         touch_dm_index(db, gid, owner)
@@ -649,6 +748,15 @@ def main() -> None:
                 time.sleep(poll)
                 continue
 
+            # finish anything queued while the agent was unreachable; the
+            # agent posts group/DM replies itself via the hermesa-group CLI
+            hb.drain_queue(
+                None,
+                extra="These are GROUP/DM messages. Post each reply or "
+                      "deliverable into the right chat YOURSELF with the "
+                      "`hermesa-group` CLI (--group <gid> from the queued "
+                      "text; for private threads use `hermesa-group dm`).")
+
             users = None
             convos = dict(groups)
             dm_threads = fetch_dm_threads(db, owner)
@@ -677,6 +785,7 @@ def main() -> None:
                 if users is None:
                     users = fetch_users(db)
                 mark_seen(db, gid, owner, [m["id"] for m in new])
+                batch = []
                 for m in new:
                     st["done_ids"].append(m["id"])
                     ts = msg_ts(m)
@@ -686,9 +795,11 @@ def main() -> None:
                     if should_reply(m, owner, bid, bname, settings,
                                     st["my_ids"], msgs,
                                     bot_dm=is_bot_dm(gid, bid)):
-                        process_message(db, gid, gname, group, owner, bname,
-                                        m, users, msgs, st)
-                        save_state(st)
+                        batch.append(m)
+                if batch:
+                    process_batch(db, gid, gname, group, owner, bname,
+                                  batch, users, msgs, st)
+                    save_state(st)
         except Exception as e:
             log("loop error: %s" % e)
         time.sleep(poll)
