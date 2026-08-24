@@ -4,15 +4,49 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HOME = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
 POOL = os.path.join(HOME, "pool.json")
 BASES = {"nvidia": "https://integrate.api.nvidia.com/v1",
-         "mistral": "https://api.mistral.ai/v1"}
+         "mistral": "https://api.mistral.ai/v1",
+         "openrouter": "https://openrouter.ai/api/v1"}
 KEYS = {p: [v for k, v in sorted(os.environ.items())
             if k.startswith(pref) and v]
         for p, pref in (("nvidia", "NVIDIA_KEY_"),
-                        ("mistral", "MISTRAL_KEY_"))}
+                        ("mistral", "MISTRAL_KEY_"),
+                        ("openrouter", "OPENROUTER_KEY_"))}
+# ── routing mode: STRICT separation, never mixed ──
+# "pool" (default) -> ONLY the NVIDIA + Mistral rotating pool.
+#                     OpenRouter is never touched.
+# "openrouter"     -> ONLY OpenRouter, and ONLY the ONE specific model
+#                     saved in ~/.hermes/openrouter_model (keys still
+#                     rotate). The pool is never touched.
+# Switch with the `ai` command (bin/ai):
+#   ai or <model-id>   -> chat uses ONLY that OpenRouter model
+#   ai pool            -> back to the NVIDIA+Mistral pool
+# Both files are re-read on EVERY request, so a switch applies to the
+# very next message - no restart. ROUTE_MODE env is only the boot default.
+MODE_FILE = os.path.join(HOME, "route_mode")
+OR_MODEL_FILE = os.path.join(HOME, "openrouter_model")
+
+def route_mode():
+    try:
+        m = open(MODE_FILE).read().strip().lower()
+        if m in ("pool", "openrouter"):
+            return m
+    except Exception:
+        pass
+    m = (os.environ.get("ROUTE_MODE") or "pool").strip().lower()
+    return m if m in ("pool", "openrouter") else "pool"
+
+def openrouter_model():
+    try:
+        m = open(OR_MODEL_FILE).read().strip()
+        if m:
+            return m
+    except Exception:
+        pass
+    return (os.environ.get("OPENROUTER_MODEL") or "").strip()
 LOCK = threading.Lock()
 COOL = {}      # key -> unix ts until which it is cooling down (429)
 DEAD = set()   # keys that failed auth mid-run (401/403)
-RR = {"nvidia": 0, "mistral": 0, "pool": 0}
+RR = {"nvidia": 0, "mistral": 0, "openrouter": 0, "pool": 0}
 KSTRIKE = {}   # key -> consecutive 429 strikes (reset on success)
 KLAST = {}     # key -> unix ts of last use (least-recently-used spread)
 COOLDOWN = 30
@@ -42,6 +76,8 @@ def seed_latency(mid):
     if m.startswith(("mistral", "codestral", "magistral", "pixtral",
                      "ministral", "open-mi", "devstral")):
         return 5.0   # Mistral production API is always fast
+    if m.endswith(":free"):
+        return 9.0   # OpenRouter free tier: decent but shared capacity
     if any(t in m for t in ("nano", "mini", "tiny", "small")):
         return 4.0
     if any(t in m for t in ("medium",)):
@@ -91,6 +127,22 @@ def is_err_payload(buf):
 def candidates(model):
     pool = load_pool()
     if model in ("", None, "pool-auto"):
+        # ── OpenRouter mode: ONLY OpenRouter, ONLY the chosen model ──
+        # No pool fallback by design: the user explicitly switched, so
+        # the chat must never silently answer from a different provider.
+        if route_mode() == "openrouter":
+            if not KEYS.get("openrouter"):
+                return []
+            mid = openrouter_model()
+            if mid:
+                return [("openrouter", mid)]
+            # no specific model picked yet: use the OpenRouter entries
+            # ticked on the panel (still OpenRouter-only, never the pool)
+            ors = [x for x in pool if x["provider"] == "openrouter"]
+            return [("openrouter", x["id"]) for x in ors]
+        # ── pool mode (default): ONLY NVIDIA + Mistral, never OpenRouter ──
+        pool = [x for x in pool if x["provider"] in ("nvidia", "mistral")
+                and KEYS.get(x["provider"])]
         if not pool:
             return []
         now = time.time()
@@ -115,7 +167,13 @@ def candidates(model):
             return [(x["provider"], x["id"])]
     mist = ("mistral", "codestral", "magistral", "pixtral",
             "ministral", "open-mistral", "open-mixtral", "devstral")
-    prov = "mistral" if model.startswith(mist) else "nvidia"
+    if model.startswith(mist):
+        prov = "mistral"
+    elif model.endswith(":free") and KEYS.get("openrouter"):
+        # OpenRouter free-tier ids always end in ":free"
+        prov = "openrouter"
+    else:
+        prov = "nvidia"
     return [(prov, model)]
 
 class Handler(BaseHTTPRequestHandler):

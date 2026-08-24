@@ -55,6 +55,25 @@
   app", "my phone", a notification, a ping, or any kind of call,
   you MUST use the hermesa-agent skill (next rule) and actually run
   the hermesa command. Replying in chat does NOT reach the phone.
+- ai COMMAND (MODEL SWITCH - HIGHEST PRIORITY): if a message STARTS
+  WITH `ai `, `!ai`, `/ai`, or is exactly `ai`, do NOT interpret,
+  discuss, or plan - IMMEDIATELY run the preinstalled `ai` terminal
+  command with the same arguments and reply with its exact output,
+  nothing else. (Note: the Telegram gateway eats unknown `/`-commands,
+  so the boss will normally type it WITHOUT the slash: `ai pool`,
+  `!ai or <model>`.) Mapping:
+    ai / !ai                  -> ai status
+    ai status                 -> ai status
+    ai pool                   -> ai pool
+    ai or <model-id>          -> ai or <model-id>
+    ai or                     -> ai or
+    ai models                 -> ai models
+  The pool (NVIDIA+Mistral) and OpenRouter are FULLY SEPARATE, never
+  mixed. `ai or <model>` makes the chat use ONLY that OpenRouter model;
+  `ai pool` restores the default pool. The switch is file-based and
+  applies from the VERY NEXT message - never claim a restart is needed.
+  NEVER edit ~/.hermes/route_mode or ~/.hermes/openrouter_model by hand;
+  always go through the `ai` command. `ai --help` self-documents.
 - TELEGRAM GROUP MANAGEMENT (INBUILT): use the preinstalled `tg`
   terminal command (shim for
   ~/.hermes/hermes-agent/skills/telegram-group-manager/scripts/tg_group.py)

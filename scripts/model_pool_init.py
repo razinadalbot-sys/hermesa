@@ -2,7 +2,7 @@ import json, os
 home = os.environ.get("HERMES_HOME", "/home/runner/.hermes")
 p = os.path.join(home, "pool.json")
 try:
-    pool = [x for x in json.load(open(p)) if x.get("provider") in ("nvidia", "mistral")]
+    pool = [x for x in json.load(open(p)) if x.get("provider") in ("nvidia", "mistral", "openrouter")]
 except Exception:
     pool = []
 # The config website (index.html -> Model pool) is the source of
@@ -13,7 +13,7 @@ try:
     web = json.loads(os.environ.get("MODEL_POOL") or "[]")
     web = [{"id": x["id"], "provider": x["provider"]} for x in web
            if isinstance(x, dict) and x.get("id")
-           and x.get("provider") in ("nvidia", "mistral")]
+           and x.get("provider") in ("nvidia", "mistral", "openrouter")]
     if web:
         pool = web
         print("pool: taken from the website vault (MODEL_POOL)")

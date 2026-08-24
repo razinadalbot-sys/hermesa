@@ -17,9 +17,18 @@ POOL = os.path.join(HERMES_HOME, "pool.json")
 CFG = "/tmp/litellm.yaml"
 KEY_NAMES = sorted(k for k in os.environ if k.startswith("NVIDIA_KEY_") and os.environ[k])
 MISTRAL_KEY_NAMES = sorted(k for k in os.environ if k.startswith("MISTRAL_KEY_") and os.environ[k])
+OPENROUTER_KEY_NAMES = sorted(k for k in os.environ if k.startswith("OPENROUTER_KEY_") and os.environ[k])
 MISTRAL_MODELS = ["mistral-large-latest", "mistral-medium-latest",
                   "mistral-small-latest", "codestral-latest"]
 BASE = "https://integrate.api.nvidia.com/v1"
+MISTRAL_BASE = "https://api.mistral.ai/v1"
+OPENROUTER_BASE = "https://openrouter.ai/api/v1"
+PROVIDER_BASES = {"nvidia": BASE, "mistral": MISTRAL_BASE,
+                  "openrouter": OPENROUTER_BASE}
+
+def keys_of(provider):
+    return {"nvidia": KEY_NAMES, "mistral": MISTRAL_KEY_NAMES,
+            "openrouter": OPENROUTER_KEY_NAMES}.get(provider, [])
 
 def fetch_models(base, key):
     r = urllib.request.Request(base + "/models",
@@ -29,7 +38,8 @@ def fetch_models(base, key):
 
 def load_pool():
     try:
-        return [x for x in json.load(open(POOL)) if x.get("provider") in ("nvidia", "mistral")]
+        return [x for x in json.load(open(POOL))
+                if x.get("provider") in ("nvidia", "mistral", "openrouter")]
     except Exception:
         return []
 
@@ -43,8 +53,8 @@ def probe(provider, mid):
     # labs models in /models but gets 4xx when calling them).
     # Returns False only on a definitive 4xx = "not usable on this
     # plan/key". 429 (busy) and 5xx/network issues fail open.
-    base = BASE if provider == "nvidia" else "https://api.mistral.ai/v1"
-    keys = KEY_NAMES if provider == "nvidia" else MISTRAL_KEY_NAMES
+    base = PROVIDER_BASES.get(provider, BASE)
+    keys = keys_of(provider)
     if not keys:
         return False
     body = json.dumps({"model": mid, "max_tokens": 1,
@@ -74,14 +84,19 @@ def prune_pool(pool):
         pass
     try:
         if MISTRAL_KEY_NAMES:
-            live["mistral"] = set(fetch_models("https://api.mistral.ai/v1", MISTRAL_KEY_NAMES[0]))
+            live["mistral"] = set(fetch_models(MISTRAL_BASE, MISTRAL_KEY_NAMES[0]))
+    except Exception:
+        pass
+    try:
+        if OPENROUTER_KEY_NAMES:
+            live["openrouter"] = set(fetch_models(OPENROUTER_BASE, OPENROUTER_KEY_NAMES[0]))
     except Exception:
         pass
     kept, removed = [], []
     for it in pool:
         # a provider with ZERO working keys has zero deployments:
         # its pool entries are useless, drop them
-        keys_for = KEY_NAMES if it["provider"] == "nvidia" else MISTRAL_KEY_NAMES
+        keys_for = keys_of(it["provider"])
         if not keys_for:
             removed.append(it["id"])
             continue
@@ -115,9 +130,10 @@ def auto_prune_loop():
 def write_config(pool):
     L = ["model_list:"]
     def dep(alias, provider, mid):
-        keys = KEY_NAMES if provider == "nvidia" else MISTRAL_KEY_NAMES
-        prefix = "nvidia_nim/" if provider == "nvidia" else "mistral/"
-        rpm = "40" if provider == "nvidia" else "30"
+        keys = keys_of(provider)
+        prefix = {"nvidia": "nvidia_nim/", "mistral": "mistral/",
+                  "openrouter": "openrouter/"}[provider]
+        rpm = {"nvidia": "40", "mistral": "30", "openrouter": "20"}[provider]
         for k in keys:
             L.append('  - model_name: "%s"' % alias)
             L.append("    litellm_params:")
@@ -127,7 +143,8 @@ def write_config(pool):
             # tokens-per-minute budget: with pre-call checks on, the
             # router SKIPS keys whose TPM quota is spent this minute
             # instead of firing a request that will 429
-            L.append("      tpm: " + ("400000" if provider == "nvidia" else "500000"))
+            L.append("      tpm: " + {"nvidia": "400000", "mistral": "500000",
+                                       "openrouter": "300000"}[provider])
     for it in pool:
         # each selected model is callable by its own name...
         dep(it["id"], it["provider"], it["id"])

@@ -31,7 +31,27 @@ except Exception as e:
     print("fbpool: MODEL_POOL unreadable: %s" % e); sys.exit(1)
 pool = [{"id": x["id"], "provider": x["provider"]} for x in (items or [])
         if isinstance(x, dict) and x.get("id")
-        and x.get("provider") in ("nvidia", "mistral")]
+        and x.get("provider") in ("nvidia", "mistral", "openrouter")]
+
+# routing mode (pool | openrouter). The `ai` command is the primary way
+# to switch and writes ~/.hermes/route_mode directly. The panel can also
+# switch via the vault, so we only apply the VAULT value when it CHANGED
+# since our last poll (tracked in a side file) - otherwise this 60s loop
+# would keep overwriting a switch the user just made with the command.
+mode = str(data.get("ROUTE_MODE") or "").strip().lower()
+if mode in ("pool", "openrouter"):
+    mpath = os.path.join(home, "route_mode")
+    seen = os.path.join(home, ".route_mode_vault")
+    try:
+        last_vault = open(seen).read().strip()
+    except Exception:
+        last_vault = None
+    if last_vault != mode:              # panel actually flipped the switch
+        os.makedirs(home, exist_ok=True)
+        open(mpath, "w").write(mode + "\n")
+        open(seen, "w").write(mode + "\n")
+        print("route mode -> " + mode + " (panel)")
+
 if not pool:
     print("fbpool: no models applied on the website yet"); sys.exit(1)
 try:
